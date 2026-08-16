@@ -1,0 +1,443 @@
+import { Button, CheckBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
+
+export struct RuleRow {
+    id: string,
+    name: string,
+    matcher: string,
+    enabled: bool,
+    allow-suspend: bool,
+    throttle-minutes: int,
+    suspend-minutes: int,
+    built-in: bool,
+}
+
+export struct StatusRow {
+    rule-id: string,
+    title: string,
+    state: string,
+    detail: string,
+    pid: int,
+    process-count: int,
+    state-color: color,
+}
+
+export struct AppRow {
+    name: string,
+    path: string,
+    pid: int,
+    source-index: int,
+}
+
+export struct EventRow {
+    time: string,
+    message: string,
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <int> index;
+    in property <int> current;
+    callback selected(int);
+    height: 38px;
+    border-radius: 6px;
+    background: current == index ? #e8f3ed : area.has-hover ? #f2f5f3 : transparent;
+    area := TouchArea { clicked => { root.selected(index); } }
+    Text {
+        x: 13px;
+        text: root.label;
+        vertical-alignment: center;
+        color: current == index ? #17633d : #354139;
+        font-size: 13px;
+        font-weight: current == index ? 700 : 500;
+    }
+}
+
+component StateBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> badge-color;
+    width: 72px;
+    height: 24px;
+    border-radius: 6px;
+    background: badge-color;
+    Text { text: root.text; horizontal-alignment: center; vertical-alignment: center; color: #ffffff; font-size: 11px; font-weight: 600; }
+}
+
+component EmptyState inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    border-width: 1px;
+    border-color: #d8dfda;
+    border-radius: 7px;
+    background: #ffffff;
+    VerticalLayout {
+        alignment: center;
+        spacing: 7px;
+        Text { text: root.title; horizontal-alignment: center; color: #2c3630; font-size: 15px; font-weight: 600; }
+        Text { text: root.detail; horizontal-alignment: center; color: #68736c; font-size: 12px; wrap: word-wrap; }
+    }
+}
+
+export component ControlPanel inherits Window {
+    title: "Lazy Process";
+    icon: @image-url("tray-icon.svg");
+    width: 980px;
+    height: 680px;
+    background: #f5f7f5;
+
+    in-out property <int> page: 0;
+    in-out property <int> selected-rule: -1;
+    in-out property <int> selected-app: -1;
+    in-out property <int> selected-app-source: -1;
+    in-out property <int> selected-status: -1;
+    in-out property <string> app-filter: "";
+    in property <bool> globally-enabled: true;
+    in property <bool> start-with-windows: false;
+    in property <[RuleRow]> rules;
+    in property <[StatusRow]> statuses;
+    in property <[AppRow]> apps;
+    in property <[EventRow]> events;
+    in property <string> footer-status: "正在初始化";
+    in property <string> config-path: "";
+    in property <string> cpu-chart-path: "M 0 40 L 100 40";
+    in property <string> cpu-current: "0.0%";
+    in property <string> cpu-peak: "0.0%";
+    in property <int> chart-process-count: 0;
+    in property <int> chart-group-count: 0;
+
+    callback set-global-enabled(bool);
+    callback set-start-with-windows(bool);
+    callback restore-all();
+    callback enable-elevation();
+    callback refresh-now();
+    callback filter-apps(string);
+    callback set-rule-enabled(int, bool);
+    callback set-rule-suspend(int, bool);
+    callback adjust-throttle(int, int);
+    callback adjust-suspend(int, int);
+    callback remove-rule(int);
+    callback add-app(int);
+    callback open-config();
+    callback hide-window();
+    callback exit-app();
+    callback page-selected(int);
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 188px;
+            background: #ffffff;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 6px;
+                Rectangle {
+                    height: 54px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            width: 36px; height: 36px; border-radius: 6px; background: #22784a;
+                            Text { text: "L"; color: white; font-size: 19px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: "Lazy Process"; color: #202a24; font-size: 15px; font-weight: 700; }
+                            Text { text: "进程空闲调度"; color: #738078; font-size: 11px; }
+                        }
+                    }
+                }
+                NavItem { label: "概览"; index: 0; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "应用规则"; index: 1; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "添加应用"; index: 2; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "事件日志"; index: 3; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                Rectangle { vertical-stretch: 1; }
+                Rectangle {
+                    height: 78px;
+                    background: #f2f6f3;
+                    border-radius: 6px;
+                    VerticalLayout {
+                        padding: 10px;
+                        Text { text: root.globally-enabled ? "监控已启用" : "监控已暂停"; color: root.globally-enabled ? #17633d : #9a4a2d; font-size: 12px; font-weight: 600; }
+                        Text { text: root.footer-status; color: #68736c; font-size: 10px; wrap: word-wrap; }
+                    }
+                }
+            }
+        }
+        Rectangle { width: 1px; background: #dce2dd; }
+        Rectangle {
+            background: #f5f7f5;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+
+                if root.page == 0 : VerticalLayout {
+                    spacing: 14px;
+                    HorizontalLayout {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        Text { text: "运行概览"; color: #202a24; font-size: 21px; font-weight: 700; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "全部恢复"; clicked => { root.restore-all(); } }
+                        Button { text: "按需管理员"; clicked => { root.enable-elevation(); } }
+                        Button { text: "刷新"; clicked => { root.refresh-now(); } }
+                    }
+                    Rectangle {
+                        height: 62px;
+                        vertical-stretch: 0;
+                        background: #ffffff;
+                        border-width: 1px;
+                        border-color: #d8dfda;
+                        border-radius: 7px;
+                        HorizontalLayout {
+                            padding: 14px;
+                            CheckBox { text: "启用自动降载"; checked: root.globally-enabled; toggled => { root.set-global-enabled(self.checked); } }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: "恢复快捷键  Ctrl+Alt+Shift+F12"; color: #68736c; font-size: 12px; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        height: 146px;
+                        vertical-stretch: 0;
+                        background: #ffffff;
+                        border-width: 1px;
+                        border-color: #d8dfda;
+                        border-radius: 7px;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                height: 28px;
+                                vertical-stretch: 0;
+                                Text { text: "CPU 趋势"; color: #263129; font-size: 13px; font-weight: 700; vertical-alignment: center; }
+                                Text { text: "最近约 2 分钟"; color: #7a857e; font-size: 10px; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: root.chart-group-count + " 组 · " + root.chart-process-count + " 个进程"; color: #68736c; font-size: 10px; vertical-alignment: center; }
+                                Text { text: root.cpu-current; color: #17633d; font-size: 17px; font-weight: 700; vertical-alignment: center; }
+                            }
+                            chart := Rectangle {
+                                background: #f8faf8;
+                                border-radius: 4px;
+                                Rectangle { y: parent.height / 2; height: 1px; background: #e6ebe7; }
+                                Rectangle { y: parent.height - 1px; height: 1px; background: #dce3de; }
+                                Path {
+                                    x: 4px;
+                                    y: 4px;
+                                    width: parent.width - 8px;
+                                    height: parent.height - 8px;
+                                    commands: root.cpu-chart-path;
+                                    viewbox-width: 100;
+                                    viewbox-height: 40;
+                                    stroke: #278052;
+                                    stroke-width: 2px;
+                                    fill: transparent;
+                                }
+                                Text { x: 7px; y: 5px; text: "峰值 " + root.cpu-peak; color: #7a857e; font-size: 9px; }
+                            }
+                        }
+                    }
+                    if root.statuses.length == 0 : EmptyState { title: "暂时没有匹配进程"; detail: "启用的规则匹配到应用后，会在这里显示活动状态和进程树。"; }
+                    if root.statuses.length > 0 : ScrollView {
+                        VerticalLayout {
+                            spacing: 7px;
+                            for status[i] in root.statuses : Rectangle {
+                                height: 66px;
+                                background: #ffffff;
+                                border-width: root.selected-status == i ? 2px : 1px;
+                                border-color: root.selected-status == i ? #35875c : #d8dfda;
+                                border-radius: 7px;
+                                TouchArea { clicked => { root.selected-status = i; } }
+                                HorizontalLayout {
+                                    padding: 12px;
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        spacing: 5px;
+                                        Text { text: status.title; color: #263129; font-size: 14px; font-weight: 600; }
+                                        Text { text: status.detail; color: #68736c; font-size: 11px; overflow: elide; }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Text { text: status.process-count + " 个进程"; color: #68736c; font-size: 11px; vertical-alignment: center; }
+                                    StateBadge { text: status.state; badge-color: status.state-color; }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.page == 1 : VerticalLayout {
+                    spacing: 13px;
+                    Text { text: "应用规则"; color: #202a24; font-size: 21px; font-weight: 700; }
+                    Text { text: "一级降载降低优先级并启用 Efficiency Mode；二级暂停必须逐条显式允许。"; color: #68736c; font-size: 12px; }
+                    if root.rules.length == 0 : EmptyState { title: "没有规则"; detail: "从“添加应用”选择一个正在运行的应用。"; }
+                    if root.rules.length > 0 : ScrollView {
+                        VerticalLayout {
+                            spacing: 8px;
+                            for rule[i] in root.rules : Rectangle {
+                                height: 112px;
+                                background: #ffffff;
+                                border-width: root.selected-rule == i ? 2px : 1px;
+                                border-color: root.selected-rule == i ? #35875c : #d8dfda;
+                                border-radius: 7px;
+                                TouchArea { clicked => { root.selected-rule = i; } }
+                                VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 7px;
+                                    HorizontalLayout {
+                                        Text { text: rule.name; color: #263129; font-size: 14px; font-weight: 700; }
+                                        Text { text: rule.built-in ? "预设" : "自定义"; color: #7b4c2b; font-size: 10px; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Button { text: rule.enabled ? "停用" : "启用"; clicked => { root.set-rule-enabled(i, !rule.enabled); } }
+                                        Button { text: "删除"; enabled: !rule.built-in; clicked => { root.remove-rule(i); } }
+                                    }
+                                    Text { text: rule.matcher; color: #68736c; font-size: 11px; overflow: elide; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text { text: "低耗 " + rule.throttle-minutes + " 分钟"; color: #354139; font-size: 11px; vertical-alignment: center; }
+                                        Button { text: "−"; clicked => { root.adjust-throttle(i, -1); } }
+                                        Button { text: "+"; clicked => { root.adjust-throttle(i, 1); } }
+                                        Text { text: "暂停 " + rule.suspend-minutes + " 分钟"; color: #354139; font-size: 11px; vertical-alignment: center; }
+                                        Button { text: "−"; clicked => { root.adjust-suspend(i, -5); } }
+                                        Button { text: "+"; clicked => { root.adjust-suspend(i, 5); } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        CheckBox { text: "允许暂停"; checked: rule.allow-suspend; toggled => { root.set-rule-suspend(i, self.checked); } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.page == 2 : VerticalLayout {
+                    spacing: 13px;
+                    HorizontalLayout {
+                        Text { text: "添加正在运行的应用"; color: #202a24; font-size: 21px; font-weight: 700; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "刷新"; clicked => { root.refresh-now(); } }
+                    }
+                    Text { text: "选择后将按完整可执行路径创建规则；同名但来自其他宿主的进程不会被包含。"; color: #68736c; font-size: 12px; }
+                    HorizontalLayout {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        spacing: 8px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            placeholder-text: "筛选名称、路径或 PID";
+                            text <=> root.app-filter;
+                            edited(text) => { root.filter-apps(text); }
+                        }
+                        Text { text: root.apps.length + " 个结果"; color: #68736c; font-size: 10px; vertical-alignment: center; }
+                        Button {
+                            text: "清空";
+                            enabled: root.app-filter != "";
+                            clicked => {
+                                root.app-filter = "";
+                                root.filter-apps("");
+                            }
+                        }
+                    }
+                    if root.apps.length == 0 : EmptyState {
+                        title: root.app-filter == "" ? "没有可选应用" : "没有匹配应用";
+                        detail: root.app-filter == "" ? "刷新后仍为空时，请先启动需要管理的应用。" : "尝试缩短关键词，或改用进程名、路径和 PID。";
+                    }
+                    if root.apps.length > 0 : Rectangle {
+                        background: #ffffff;
+                        border-width: 1px;
+                        border-color: #d8dfda;
+                        border-radius: 7px;
+                        VerticalLayout {
+                            padding: 12px;
+                            app-list := ListView {
+                                for app[i] in root.apps : Rectangle {
+                                    width: app-list.width;
+                                    height: 56px;
+                                    background: root.selected-app == i ? #e8f3ed : app-row-area.has-hover ? #f6f8f6 : #ffffff;
+
+                                    app-row-area := TouchArea {
+                                        clicked => {
+                                            root.selected-app = i;
+                                            root.selected-app-source = app.source-index;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        spacing: 10px;
+                                        CheckBox {
+                                            text: "";
+                                            checked: root.selected-app == i;
+                                            toggled => {
+                                                root.selected-app = self.checked ? i : -1;
+                                                root.selected-app-source = self.checked ? app.source-index : -1;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            alignment: center;
+                                            spacing: 3px;
+                                            Text { text: app.name; color: #263129; font-size: 13px; font-weight: 600; overflow: elide; }
+                                            Text { text: app.path; color: #738078; font-size: 10px; overflow: elide; }
+                                        }
+                                        Text { text: "PID " + app.pid; color: #68736c; font-size: 10px; vertical-alignment: center; }
+                                    }
+
+                                    Rectangle {
+                                        y: parent.height - 1px;
+                                        height: 1px;
+                                        background: #e6ebe7;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                height: 36px;
+                                vertical-stretch: 0;
+                                Rectangle { horizontal-stretch: 1; }
+                                Button { text: "添加应用规则"; enabled: root.selected-app-source >= 0; clicked => { root.add-app(root.selected-app-source); } }
+                            }
+                        }
+                    }
+                }
+
+                if root.page == 3 : VerticalLayout {
+                    spacing: 13px;
+                    Text { text: "事件日志"; color: #202a24; font-size: 21px; font-weight: 700; }
+                    Text { text: "仅记录状态变化和错误，不保存终端输出或完整命令行。"; color: #68736c; font-size: 12px; }
+                    if root.events.length == 0 : EmptyState { title: "还没有事件"; detail: "进入低耗、暂停、恢复和权限错误时会出现在这里。"; }
+                    if root.events.length > 0 : ScrollView {
+                        VerticalLayout {
+                            spacing: 1px;
+                            for event in root.events : Rectangle {
+                                height: 38px;
+                                background: #ffffff;
+                                HorizontalLayout {
+                                    padding-left: 10px; padding-right: 10px;
+                                    Text { width: 76px; text: event.time; color: #7a857e; font-size: 10px; vertical-alignment: center; }
+                                    Text { text: event.message; color: #354139; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 1px; background: #d8dfda; }
+                    HorizontalLayout {
+                        Text { text: root.config-path; color: #7a857e; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        CheckBox { text: "开机启动"; checked: root.start-with-windows; toggled => { root.set-start-with-windows(self.checked); } }
+                        Button { text: "打开配置"; clicked => { root.open-config(); } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppTray inherits SystemTrayIcon {
+    icon: @image-url("tray-icon.svg");
+    tooltip: "Lazy Process";
+    Menu {
+        MenuItem { title: "打开 Lazy Process"; activated => { root.open(); } }
+        MenuItem { title: "全部恢复"; activated => { root.restore-all(); } }
+        MenuItem { title: "暂停/继续监控"; activated => { root.toggle-enabled(); } }
+        MenuItem { title: "退出"; activated => { root.quit(); } }
+    }
+    callback open();
+    callback restore-all();
+    callback toggle-enabled();
+    callback quit();
+}

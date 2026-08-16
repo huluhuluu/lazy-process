@@ -51,6 +51,7 @@ struct RuntimeState {
     candidates: Arc<Mutex<Vec<AppCandidate>>>,
     events: Arc<Mutex<VecDeque<EventEntry>>>,
     metrics: Arc<Mutex<VecDeque<MetricSample>>>,
+    save_error: Arc<Mutex<Option<String>>>,
     config_path: PathBuf,
 }
 
@@ -142,6 +143,7 @@ fn run() -> Result<(), String> {
         candidates: Arc::new(Mutex::new(Vec::new())),
         events: Arc::new(Mutex::new(VecDeque::new())),
         metrics: Arc::new(Mutex::new(VecDeque::new())),
+        save_error: Arc::new(Mutex::new(None)),
         config_path,
     };
     if let Some(error) = config_error {
@@ -303,6 +305,22 @@ fn install_callbacks(
     panel.on_open_config(move || {
         let _ = Command::new("notepad.exe").arg(&path).spawn();
     });
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    panel.on_retry_save(move || {
+        retry_config_save(&runtime);
+        if let Some(panel) = weak.upgrade() {
+            refresh_panel(&panel, &runtime);
+        }
+    });
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    panel.on_dismiss_save_error(move || {
+        clear_save_error(&runtime);
+        if let Some(panel) = weak.upgrade() {
+            refresh_panel(&panel, &runtime);
+        }
+    });
     panel.on_hide_window({
         let weak = panel.as_weak();
         move || {
@@ -398,6 +416,7 @@ fn start_worker(
         let mut sampler = ProcessSampler::new();
         let mut engine = Engine::new(WindowsResourceController::new(journal));
         let mut previous = HashMap::<(String, u32), ActivityState>::new();
+        let mut idle_cycles = 0_u32;
         while !stop.load(Ordering::Acquire) {
             let config = state
                 .config
@@ -414,6 +433,13 @@ fn start_worker(
             );
             log_transitions(&state, &mut previous, &statuses);
             record_metrics(&state, &statuses);
+            if statuses.is_empty() {
+                idle_cycles = idle_cycles.saturating_add(1);
+            } else {
+                idle_cycles = 0;
+            }
+            let interval =
+                adaptive_sample_interval(&config, &statuses, processes.len(), idle_cycles);
             if let Ok(mut guard) = state.statuses.lock() {
                 *guard = statuses;
             }
@@ -427,9 +453,7 @@ fn start_worker(
                     }
                 }
             });
-
-            match commands.recv_timeout(Duration::from_secs(config.sample_interval_seconds.max(1)))
-            {
+            match commands.recv_timeout(interval) {
                 Ok(WorkerCommand::RestoreAll) => {
                     let errors = engine.restore_all();
                     if errors.is_empty() {
@@ -451,6 +475,33 @@ fn start_worker(
             push_event(&state, format!("退出恢复失败：{error}"));
         }
     })
+}
+
+fn adaptive_sample_interval(
+    config: &AppConfig,
+    statuses: &[GroupStatus],
+    process_count: usize,
+    idle_cycles: u32,
+) -> Duration {
+    if statuses.iter().any(|status| {
+        matches!(
+            status.state,
+            ActivityState::Active | ActivityState::Unresponsive
+        )
+    }) {
+        return Duration::from_secs(1);
+    }
+    let base = config.sample_interval_seconds.clamp(1, 10);
+    if !statuses.is_empty() {
+        return Duration::from_secs(base);
+    }
+    let backoff = 1_u64 << idle_cycles.min(3);
+    let interval = base.saturating_mul(backoff).clamp(1, 10);
+    if process_count > 1_000 {
+        Duration::from_secs(interval.max(5))
+    } else {
+        Duration::from_secs(interval)
+    }
 }
 
 fn start_hotkey(
@@ -550,6 +601,13 @@ fn refresh_panel(panel: &ControlPanel, state: &RuntimeState) {
     panel.set_globally_enabled(config.globally_enabled);
     panel.set_start_with_windows(config.start_with_windows);
     panel.set_config_path(state.config_path.display().to_string().into());
+    let save_error = state
+        .save_error
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_default();
+    panel.set_save_error(save_error.into());
     let rules = config
         .rules
         .iter()
@@ -730,12 +788,48 @@ fn mutate_rule(state: &RuntimeState, index: i32, mutation: impl FnOnce(&mut Proc
 }
 
 fn mutate_config(state: &RuntimeState, mutation: impl FnOnce(&mut AppConfig)) {
-    if let Ok(mut config) = state.config.lock() {
-        mutation(&mut config);
-        if let Err(error) = config.save_atomic(&state.config_path) {
-            drop(config);
+    let result = match state.config.lock() {
+        Ok(mut config) => {
+            mutation(&mut config);
+            config.save_atomic(&state.config_path)
+        }
+        Err(_) => Err(std::io::Error::other("配置锁已损坏")),
+    };
+    match result {
+        Ok(()) => clear_save_error(state),
+        Err(error) => {
+            set_save_error(state, error.to_string());
             push_event(state, format!("配置保存失败：{error}"));
         }
+    }
+}
+
+fn retry_config_save(state: &RuntimeState) {
+    let result = match state.config.lock() {
+        Ok(config) => config.save_atomic(&state.config_path),
+        Err(_) => Err(std::io::Error::other("配置锁已损坏")),
+    };
+    match result {
+        Ok(()) => {
+            clear_save_error(state);
+            push_event(state, "配置已重试保存成功".into());
+        }
+        Err(error) => {
+            set_save_error(state, error.to_string());
+            push_event(state, format!("配置重试保存失败：{error}"));
+        }
+    }
+}
+
+fn set_save_error(state: &RuntimeState, error: String) {
+    if let Ok(mut save_error) = state.save_error.lock() {
+        *save_error = Some(error);
+    }
+}
+
+fn clear_save_error(state: &RuntimeState) {
+    if let Ok(mut save_error) = state.save_error.lock() {
+        *save_error = None;
     }
 }
 
@@ -866,5 +960,51 @@ mod tests {
         let path = cpu_chart_path(&metrics);
         assert!(path.starts_with("M 0.00 38.00"));
         assert!(path.contains("L 100.00 4.00"));
+    }
+
+    fn status(state: ActivityState) -> GroupStatus {
+        GroupStatus {
+            rule_id: "rule".into(),
+            root: lazy_process::model::ProcessIdentity {
+                pid: 10,
+                started_at: 1,
+                executable_path: PathBuf::from(r"C:\bin\app.exe"),
+            },
+            root_name: "app.exe".into(),
+            process_count: 1,
+            state,
+            quiet_seconds: 0,
+            cpu_percent: 0.0,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn adaptive_sampling_is_fast_for_active_groups() {
+        let config = AppConfig {
+            sample_interval_seconds: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            adaptive_sample_interval(&config, &[status(ActivityState::Active)], 100, 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn adaptive_sampling_backs_off_without_matches() {
+        let config = AppConfig::default();
+        assert_eq!(
+            adaptive_sample_interval(&config, &[], 100, 1),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            adaptive_sample_interval(&config, &[], 1_500, 3),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            adaptive_sample_interval(&config, &[status(ActivityState::Quiet)], 100, 0),
+            Duration::from_secs(2)
+        );
     }
 }

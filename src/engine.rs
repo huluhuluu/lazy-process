@@ -263,6 +263,15 @@ fn build_groups<'a>(
         .iter()
         .map(|sample| (sample.identity.pid, sample))
         .collect::<HashMap<_, _>>();
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for process in processes {
+        if let Some(parent) = process.parent_pid {
+            children_by_parent
+                .entry(parent)
+                .or_default()
+                .push(process.identity.pid);
+        }
+    }
     let mut rules = config
         .rules
         .iter()
@@ -287,18 +296,14 @@ fn build_groups<'a>(
             let mut members = vec![root.clone()];
             if rule.include_descendants {
                 let mut included = HashSet::from([root.identity.pid]);
-                loop {
-                    let before = included.len();
-                    for process in processes {
-                        if process
-                            .parent_pid
-                            .is_some_and(|parent| included.contains(&parent))
-                        {
-                            included.insert(process.identity.pid);
+                let mut pending = vec![root.identity.pid];
+                while let Some(parent) = pending.pop() {
+                    if let Some(children) = children_by_parent.get(&parent) {
+                        for &child in children {
+                            if included.insert(child) {
+                                pending.push(child);
+                            }
                         }
-                    }
-                    if included.len() == before {
-                        break;
                     }
                 }
                 members = processes
@@ -599,5 +604,32 @@ mod tests {
         );
         engine.tick(&test_config(false), &samples, Some(10), 12);
         assert_eq!(restores.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn indexed_process_tree_includes_deep_descendants() {
+        let samples = vec![
+            process(10, None, "codex.exe", 0.0, 0),
+            process(11, Some(10), "child.exe", 0.0, 0),
+            process(12, Some(11), "grandchild.exe", 0.0, 0),
+            process(13, Some(12), "leaf.exe", 0.0, 0),
+            process(20, None, "unrelated.exe", 0.0, 0),
+        ];
+        let config = test_config(false);
+        let groups = build_groups(&config, &samples, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.members.len(), 4);
+        assert_eq!(groups[0].1.members[0].identity.pid, 10);
+    }
+
+    #[test]
+    fn exclusions_prevent_a_rule_from_claiming_a_process() {
+        let mut config = test_config(false);
+        config.rules[0].exclusions = vec![RuleMatcher {
+            path_contains: Some("\\bin\\codex.exe".into()),
+            ..Default::default()
+        }];
+        let samples = vec![process(10, None, "codex.exe", 0.0, 0)];
+        assert!(build_groups(&config, &samples, None).is_empty());
     }
 }

@@ -5,7 +5,17 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Write},
+    iter,
     path::{Path, PathBuf},
+};
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(windows)]
+use windows::{
+    Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    core::PCWSTR,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -182,7 +192,37 @@ impl AppConfig {
         serde_json::to_writer_pretty(&mut file, self).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(temporary, path)
+        drop(file);
+        replace_file_atomic(&temporary, path)
+    }
+}
+
+pub fn replace_file_atomic(temporary: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let source = temporary
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect::<Vec<_>>();
+        let target = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect::<Vec<_>>();
+        // MoveFileExW replaces an existing file on the same volume and asks the OS to flush it.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(io::Error::other)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary, destination)
     }
 }
 
@@ -202,6 +242,20 @@ pub fn journal_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "lazy-process-config-{name}-{}-{nonce}",
+                std::process::id()
+            ))
+            .join("config.json")
+    }
 
     #[test]
     fn defaults_are_conservative() {
@@ -229,5 +283,54 @@ mod tests {
         let config: AppConfig = serde_json::from_value(value).unwrap();
         let saved = serde_json::to_value(config).unwrap();
         assert_eq!(saved["future_setting"]["enabled"], true);
+    }
+
+    #[test]
+    fn repeated_atomic_saves_replace_the_existing_config() {
+        let path = test_config_path("replace");
+        let mut config = AppConfig::default();
+        config.save_atomic(&path).unwrap();
+        config.globally_enabled = false;
+        config.sample_interval_seconds = 7;
+        config.save_atomic(&path).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert!(!loaded.globally_enabled);
+        assert_eq!(loaded.sample_interval_seconds, 7);
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_preserves_the_existing_file() {
+        let path = test_config_path("failure");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original").unwrap();
+        let missing = path.with_file_name("missing.tmp");
+
+        assert!(replace_file_atomic(&missing, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_and_future_configs_are_rejected_without_overwrite() {
+        let path = test_config_path("invalid");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not json").unwrap();
+        assert!(AppConfig::load_or_create(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"not json");
+
+        let future = serde_json::json!({
+            "schema_version": SCHEMA_VERSION + 1,
+            "rules": []
+        });
+        fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(AppConfig::load_or_create(&path).is_err());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+            future
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

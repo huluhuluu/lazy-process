@@ -98,6 +98,7 @@ export component ControlPanel inherits Window {
     in property <[EventRow]> events;
     in property <string> footer-status: "正在初始化";
     in property <string> config-path: "";
+    in property <string> save-error: "";
     in property <string> cpu-chart-path: "M 0 40 L 100 40";
     in property <string> cpu-current: "0.0%";
     in property <string> cpu-peak: "0.0%";
@@ -120,6 +121,8 @@ export component ControlPanel inherits Window {
     callback hide-window();
     callback exit-app();
     callback page-selected(int);
+    callback retry-save();
+    callback dismiss-save-error();
 
     HorizontalLayout {
         spacing: 0px;
@@ -421,6 +424,38 @@ export component ControlPanel inherits Window {
                         CheckBox { text: "开机启动"; checked: root.start-with-windows; toggled => { root.set-start-with-windows(self.checked); } }
                         Button { text: "打开配置"; clicked => { root.open-config(); } }
                     }
+                }
+            }
+        }
+    }
+
+    if root.save-error != "" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #1d2922aa;
+        z: 10;
+        Rectangle {
+            x: (parent.width - 430px) / 2;
+            y: (parent.height - 190px) / 2;
+            width: 430px;
+            height: 190px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d8dfda;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: "配置保存失败"; color: #8d3d2f; font-size: 17px; font-weight: 700; }
+                Text { text: root.save-error; color: #354139; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "关闭"; clicked => { root.dismiss-save-error(); } }
+                    Button { text: "打开配置"; clicked => { root.open-config(); } }
+                    Button { text: "重试保存"; clicked => { root.retry-save(); } }
                 }
             }
         }

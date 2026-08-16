@@ -1,4 +1,5 @@
 use crate::{
+    config::replace_file_atomic,
     engine::ResourceController,
     model::{ProcessIdentity, ProcessSample},
 };
@@ -60,6 +61,15 @@ unsafe extern "system" {
 pub struct ProcessSampler {
     system: System,
     own_pid: u32,
+    metadata: HashMap<(u32, u64), CachedProcessMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProcessMetadata {
+    executable_path: PathBuf,
+    parent_pid: Option<u32>,
+    name: String,
+    command_line: String,
 }
 
 impl ProcessSampler {
@@ -68,43 +78,58 @@ impl ProcessSampler {
         Self {
             system: System::new(),
             own_pid: std::process::id(),
+            metadata: HashMap::new(),
         }
     }
 
     pub fn sample(&mut self) -> Vec<ProcessSample> {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.system
-            .processes()
-            .iter()
-            .filter_map(|(pid, process)| {
-                let pid = pid.as_u32();
-                if pid == self.own_pid {
-                    return None;
-                }
-                let executable_path = process.exe()?.to_path_buf();
-                let command_line = process
-                    .cmd()
-                    .iter()
-                    .map(|part| part.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let disk = process.disk_usage();
-                Some(ProcessSample {
-                    identity: ProcessIdentity {
-                        pid,
-                        started_at: process.start_time(),
-                        executable_path,
-                    },
+        let mut present = HashSet::new();
+        let mut samples = Vec::with_capacity(self.system.processes().len());
+        for (pid, process) in self.system.processes() {
+            let pid = pid.as_u32();
+            if pid == self.own_pid {
+                continue;
+            }
+            let started_at = process.start_time();
+            let Some(executable_path) = process.exe() else {
+                continue;
+            };
+            let key = (pid, started_at);
+            present.insert(key);
+            let metadata = self
+                .metadata
+                .entry(key)
+                .or_insert_with(|| CachedProcessMetadata {
+                    executable_path: executable_path.to_path_buf(),
                     parent_pid: process.parent().map(sysinfo::Pid::as_u32),
                     name: process.name().to_string_lossy().into_owned(),
-                    command_line,
-                    cpu_percent: process.cpu_usage(),
-                    io_bytes: disk
-                        .total_read_bytes
-                        .saturating_add(disk.total_written_bytes),
+                    command_line: process
+                        .cmd()
+                        .iter()
+                        .map(|part| part.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
                 })
-            })
-            .collect()
+                .clone();
+            let disk = process.disk_usage();
+            samples.push(ProcessSample {
+                identity: ProcessIdentity {
+                    pid,
+                    started_at,
+                    executable_path: metadata.executable_path,
+                },
+                parent_pid: metadata.parent_pid,
+                name: metadata.name,
+                command_line: metadata.command_line,
+                cpu_percent: process.cpu_usage(),
+                io_bytes: disk
+                    .total_read_bytes
+                    .saturating_add(disk.total_written_bytes),
+            });
+        }
+        self.metadata.retain(|key, _| present.contains(key));
+        samples
     }
 }
 
@@ -275,7 +300,7 @@ impl WindowsResourceController {
             &temporary,
             serde_json::to_vec_pretty(&records).map_err(io::Error::other)?,
         )?;
-        fs::rename(temporary, &self.journal_path)
+        replace_file_atomic(&temporary, &self.journal_path)
     }
 
     fn open_verified(

@@ -313,7 +313,7 @@ fn build_groups<'a>(
                     .collect();
                 members.sort_by_key(|member| member.identity.pid != root.identity.pid);
             }
-            claimed.insert(root.identity.clone());
+            claimed.extend(members.iter().map(|member| member.identity.clone()));
             let focused = foreground_pid
                 .is_some_and(|pid| members.iter().any(|member| member.identity.pid == pid));
             groups.push((
@@ -631,5 +631,27 @@ mod tests {
         }];
         let samples = vec![process(10, None, "codex.exe", 0.0, 0)];
         assert!(build_groups(&config, &samples, None).is_empty());
+    }
+
+    #[test]
+    fn descendants_are_claimed_once_when_rules_overlap() {
+        let mut config = test_config(false);
+        config.rules.push(ProcessRule {
+            id: "child-codex".into(),
+            name: "Child Codex".into(),
+            matcher: RuleMatcher {
+                process_name: Some("codex.exe".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let samples = vec![
+            process(10, None, "codex.exe", 0.0, 0),
+            process(11, Some(10), "codex.exe", 0.0, 0),
+            process(12, Some(11), "pwsh.exe", 0.0, 0),
+        ];
+        let groups = build_groups(&config, &samples, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.members.len(), 3);
     }
 }

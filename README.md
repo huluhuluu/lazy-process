@@ -11,7 +11,7 @@ presets and supports exact-path rules for any running desktop application.
 - Tier 2 process suspension is disabled until explicitly enabled per rule.
 - Returning the host application to the foreground restores its entire tree.
 - `Ctrl+Alt+Shift+F12` and the tray menu restore every managed process.
-- A separate watchdog resumes suspended processes if Lazy Process exits or crashes.
+- A separate watchdog restores priority, power-throttling, and suspended state if Lazy Process exits or crashes.
 - An optional UAC-elevated helper handles protected processes over a local-only pipe and exits with the main app.
 - PID, process creation time, and executable path are revalidated before each action.
 

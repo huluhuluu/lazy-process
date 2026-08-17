@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    fs, io,
+    fs,
+    io::{self, Write},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -175,18 +176,25 @@ pub fn unresponsive_process_ids() -> HashSet<u32> {
     hung
 }
 
-#[derive(Debug, Clone)]
-struct OriginalState {
-    identity: ProcessIdentity,
-    priority_class: u32,
-    power_control_mask: u32,
-    power_state_mask: u32,
-    suspended: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuspensionRecord {
     pub identity: ProcessIdentity,
+    #[serde(default)]
+    priority_class: u32,
+    #[serde(default)]
+    power_control_mask: u32,
+    #[serde(default)]
+    power_state_mask: u32,
+    #[serde(default)]
+    power_state_recorded: bool,
+    #[serde(default = "legacy_record_was_suspended")]
+    suspended: bool,
+    #[serde(default)]
+    original_state_recorded: bool,
+}
+
+const fn legacy_record_was_suspended() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -232,7 +240,7 @@ impl ElevatedBroker {
 
 #[derive(Debug)]
 pub struct WindowsResourceController {
-    originals: HashMap<(u32, u64), OriginalState>,
+    originals: HashMap<(u32, u64), SuspensionRecord>,
     journal_path: PathBuf,
     elevated: Option<ElevatedBroker>,
 }
@@ -247,8 +255,9 @@ impl WindowsResourceController {
         }
     }
 
-    fn remember(&mut self, identity: &ProcessIdentity, handle: HANDLE) {
+    fn remember(&mut self, identity: &ProcessIdentity, handle: HANDLE) -> bool {
         let key = (identity.pid, identity.started_at);
+        let inserted = !self.originals.contains_key(&key);
         self.originals.entry(key).or_insert_with(|| {
             let priority_class = unsafe { GetPriorityClass(handle) };
             let mut power = PROCESS_POWER_THROTTLING_STATE {
@@ -257,33 +266,30 @@ impl WindowsResourceController {
                 StateMask: 0,
             };
             // Unsupported Windows versions simply leave the original masks at zero.
-            let _ = unsafe {
+            let power_state_recorded = unsafe {
                 GetProcessInformation(
                     handle,
                     ProcessPowerThrottling,
                     (&raw mut power).cast::<c_void>(),
                     u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(u32::MAX),
                 )
-            };
-            OriginalState {
+            }
+            .is_ok();
+            SuspensionRecord {
                 identity: identity.clone(),
                 priority_class,
                 power_control_mask: power.ControlMask,
                 power_state_mask: power.StateMask,
+                power_state_recorded,
                 suspended: false,
+                original_state_recorded: true,
             }
         });
+        inserted
     }
 
     fn write_journal(&self) -> io::Result<()> {
-        let records = self
-            .originals
-            .values()
-            .filter(|state| state.suspended)
-            .map(|state| SuspensionRecord {
-                identity: state.identity.clone(),
-            })
-            .collect::<Vec<_>>();
+        let records = self.originals.values().cloned().collect::<Vec<_>>();
         if records.is_empty() {
             match fs::remove_file(&self.journal_path) {
                 Ok(()) => {}
@@ -296,10 +302,11 @@ impl WindowsResourceController {
             fs::create_dir_all(parent)?;
         }
         let temporary = self.journal_path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(&records).map_err(io::Error::other)?,
-        )?;
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(&records).map_err(io::Error::other)?)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
         replace_file_atomic(&temporary, &self.journal_path)
     }
 
@@ -324,43 +331,7 @@ impl WindowsResourceController {
         let Some(original) = self.originals.get(&key).cloned() else {
             return Ok(());
         };
-        let handle = Self::open_verified(
-            &original.identity,
-            PROCESS_SET_INFORMATION | PROCESS_SUSPEND_RESUME,
-        )?;
-        if original.suspended {
-            let status = unsafe { NtResumeProcess(handle.0) };
-            if status < 0 {
-                return Err(format!(
-                    "PID {} 恢复失败：NTSTATUS {status:#x}",
-                    original.identity.pid
-                ));
-            }
-        }
-        if original.priority_class != 0 {
-            unsafe {
-                SetPriorityClass(
-                    handle.0,
-                    windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(
-                        original.priority_class,
-                    ),
-                )
-            }
-            .map_err(|error| format!("PID {} 优先级恢复失败：{error}", original.identity.pid))?;
-        }
-        let power = PROCESS_POWER_THROTTLING_STATE {
-            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-            ControlMask: original.power_control_mask,
-            StateMask: original.power_state_mask,
-        };
-        let _ = unsafe {
-            SetProcessInformation(
-                handle.0,
-                ProcessPowerThrottling,
-                (&raw const power).cast::<c_void>(),
-                u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(u32::MAX),
-            )
-        };
+        restore_record(&original)?;
         self.originals.remove(&key);
         Ok(())
     }
@@ -373,7 +344,15 @@ impl ResourceController for WindowsResourceController {
         for identity in processes {
             match Self::open_verified(identity, PROCESS_SET_INFORMATION) {
                 Ok(handle) => {
-                    self.remember(identity, handle.0);
+                    let key = (identity.pid, identity.started_at);
+                    let inserted = self.remember(identity, handle.0);
+                    if let Err(error) = self.write_journal() {
+                        if inserted {
+                            self.originals.remove(&key);
+                        }
+                        errors.push(format!("PID {} 恢复日志写入失败：{error}", identity.pid));
+                        continue;
+                    }
                     if let Err(error) =
                         unsafe { SetPriorityClass(handle.0, BELOW_NORMAL_PRIORITY_CLASS) }
                     {
@@ -426,17 +405,33 @@ impl ResourceController for WindowsResourceController {
         for identity in processes {
             match Self::open_verified(identity, PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION) {
                 Ok(handle) => {
-                    self.remember(identity, handle.0);
+                    let key = (identity.pid, identity.started_at);
+                    let inserted = self.remember(identity, handle.0);
+                    let was_suspended = self
+                        .originals
+                        .get(&key)
+                        .is_some_and(|state| state.suspended);
+                    if let Some(state) = self.originals.get_mut(&key) {
+                        state.suspended = true;
+                    }
+                    if let Err(error) = self.write_journal() {
+                        if inserted {
+                            self.originals.remove(&key);
+                        } else if let Some(state) = self.originals.get_mut(&key) {
+                            state.suspended = was_suspended;
+                        }
+                        errors.push(format!("PID {} 恢复日志写入失败：{error}", identity.pid));
+                        continue;
+                    }
                     let status = unsafe { NtSuspendProcess(handle.0) };
                     if status < 0 {
+                        if let Some(state) = self.originals.get_mut(&key) {
+                            state.suspended = was_suspended;
+                        }
                         errors.push(format!(
                             "PID {} 暂停失败：NTSTATUS {status:#x}",
                             identity.pid
                         ));
-                    } else if let Some(state) =
-                        self.originals.get_mut(&(identity.pid, identity.started_at))
-                    {
-                        state.suspended = true;
                     }
                 }
                 Err(error) => elevated.push((identity.clone(), error)),
@@ -746,6 +741,68 @@ fn filetime_unix_seconds(value: FILETIME) -> u64 {
         .saturating_sub(WINDOWS_TO_UNIX_SECONDS)
 }
 
+fn restore_record(record: &SuspensionRecord) -> Result<(), String> {
+    let access = match (record.suspended, record.original_state_recorded) {
+        (true, true) => PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION,
+        (true, false) => PROCESS_SUSPEND_RESUME,
+        (false, true) => PROCESS_SET_INFORMATION,
+        (false, false) => PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = WindowsResourceController::open_verified(&record.identity, access)?;
+    let mut errors = Vec::new();
+    if record.suspended {
+        let status = unsafe { NtResumeProcess(handle.0) };
+        if status < 0 {
+            errors.push(format!(
+                "PID {} 恢复失败：NTSTATUS {status:#x}",
+                record.identity.pid
+            ));
+        }
+    }
+    if record.original_state_recorded {
+        if record.priority_class != 0
+            && let Err(error) = unsafe {
+                SetPriorityClass(
+                    handle.0,
+                    windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(
+                        record.priority_class,
+                    ),
+                )
+            }
+        {
+            errors.push(format!(
+                "PID {} 优先级恢复失败：{error}",
+                record.identity.pid
+            ));
+        }
+        if record.power_state_recorded {
+            let power = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: record.power_control_mask | PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                StateMask: record.power_state_mask,
+            };
+            if let Err(error) = unsafe {
+                SetProcessInformation(
+                    handle.0,
+                    ProcessPowerThrottling,
+                    (&raw const power).cast::<c_void>(),
+                    u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(u32::MAX),
+                )
+            } {
+                errors.push(format!(
+                    "PID {} 电源状态恢复失败：{error}",
+                    record.identity.pid
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
 #[must_use]
 pub fn recover_suspended(journal_path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(journal_path) else {
@@ -757,14 +814,8 @@ pub fn recover_suspended(journal_path: &Path) -> Vec<String> {
     };
     let mut errors = Vec::new();
     for record in records {
-        match WindowsResourceController::open_verified(&record.identity, PROCESS_SUSPEND_RESUME) {
-            Ok(handle) => {
-                let status = unsafe { NtResumeProcess(handle.0) };
-                if status < 0 {
-                    errors.push(format!("PID {} 恢复失败：{status:#x}", record.identity.pid));
-                }
-            }
-            Err(error) => errors.push(error),
+        if let Err(error) = restore_record(&record) {
+            errors.push(error);
         }
     }
     if errors.is_empty() {
@@ -842,6 +893,26 @@ mod tests {
         std::env::temp_dir().join(format!("lazy-process-{name}-{}.json", std::process::id()))
     }
 
+    fn power_state_for(identity: &ProcessIdentity) -> PROCESS_POWER_THROTTLING_STATE {
+        let handle =
+            WindowsResourceController::open_verified(identity, PROCESS_ACCESS_RIGHTS(0)).unwrap();
+        let mut power = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: 0,
+            StateMask: 0,
+        };
+        unsafe {
+            GetProcessInformation(
+                handle.0,
+                ProcessPowerThrottling,
+                (&raw mut power).cast::<c_void>(),
+                u32::try_from(size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap(),
+            )
+            .unwrap();
+        }
+        power
+    }
+
     #[test]
     fn priority_is_restored_to_its_original_value() {
         let mut child = spawn_sleeping_pwsh(20);
@@ -850,8 +921,10 @@ mod tests {
             WindowsResourceController::open_verified(&identity, PROCESS_SET_INFORMATION).unwrap();
         let original = unsafe { GetPriorityClass(handle.0) };
         drop(handle);
+        let original_power = power_state_for(&identity);
 
-        let mut controller = WindowsResourceController::new(test_journal("priority"));
+        let journal = test_journal("priority");
+        let mut controller = WindowsResourceController::new(journal.clone());
         controller
             .throttle(std::slice::from_ref(&identity))
             .unwrap();
@@ -862,12 +935,62 @@ mod tests {
             BELOW_NORMAL_PRIORITY_CLASS.0
         );
         drop(throttled);
+        assert_ne!(
+            power_state_for(&identity).StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            original_power.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        );
         controller.restore(std::slice::from_ref(&identity)).unwrap();
+        let restored =
+            WindowsResourceController::open_verified(&identity, PROCESS_SET_INFORMATION).unwrap();
+        assert_eq!(unsafe { GetPriorityClass(restored.0) }, original);
+        let restored_power = power_state_for(&identity);
+        assert_eq!(
+            restored_power.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            original_power.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(journal);
+    }
+
+    #[test]
+    fn watchdog_recovers_throttling_after_an_unclean_exit() {
+        let mut child = spawn_sleeping_pwsh(20);
+        let identity = identity_for(child.id());
+        let original = unsafe {
+            let handle =
+                WindowsResourceController::open_verified(&identity, PROCESS_SET_INFORMATION)
+                    .unwrap();
+            GetPriorityClass(handle.0)
+        };
+        let journal = test_journal("throttle-recovery");
+        let mut controller = WindowsResourceController::new(journal.clone());
+        controller
+            .throttle(std::slice::from_ref(&identity))
+            .unwrap();
+        assert!(journal.exists());
+        std::mem::forget(controller);
+
+        assert!(recover_suspended(&journal).is_empty());
         let restored =
             WindowsResourceController::open_verified(&identity, PROCESS_SET_INFORMATION).unwrap();
         assert_eq!(unsafe { GetPriorityClass(restored.0) }, original);
         let _ = child.kill();
         let _ = child.wait();
+        let _ = fs::remove_file(journal);
+    }
+
+    #[test]
+    fn old_suspension_journals_remain_compatible() {
+        let identity = ProcessIdentity {
+            pid: 123,
+            started_at: 456,
+            executable_path: PathBuf::from(r"C:\missing\process.exe"),
+        };
+        let records: Vec<SuspensionRecord> =
+            serde_json::from_value(serde_json::json!([{ "identity": identity }])).unwrap();
+        assert!(records[0].suspended);
+        assert!(!records[0].original_state_recorded);
     }
 
     #[test]

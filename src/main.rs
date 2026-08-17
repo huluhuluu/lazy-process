@@ -483,14 +483,6 @@ fn adaptive_sample_interval(
     process_count: usize,
     idle_cycles: u32,
 ) -> Duration {
-    if statuses.iter().any(|status| {
-        matches!(
-            status.state,
-            ActivityState::Active | ActivityState::Unresponsive
-        )
-    }) {
-        return Duration::from_secs(1);
-    }
     let base = config.sample_interval_seconds.clamp(1, 10);
     if !statuses.is_empty() {
         return Duration::from_secs(base);
@@ -980,14 +972,14 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_sampling_is_fast_for_active_groups() {
+    fn adaptive_sampling_honors_config_for_active_groups() {
         let config = AppConfig {
             sample_interval_seconds: 8,
             ..Default::default()
         };
         assert_eq!(
             adaptive_sample_interval(&config, &[status(ActivityState::Active)], 100, 0),
-            Duration::from_secs(1)
+            Duration::from_secs(8)
         );
     }
 

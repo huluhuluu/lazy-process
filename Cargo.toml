@@ -18,23 +18,23 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray"] }
-sysinfo = "0.39.6"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-tracing-appender = "0.2.4"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

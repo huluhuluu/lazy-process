@@ -1,2 +1,5 @@
 /target/
 *.log
+
+# Local maintenance scripts (contain machine-specific paths)
+/update-herdr-and-restore.ps1

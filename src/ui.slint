@@ -1,7 +1,33 @@
 import { Button, CheckBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
 
+// One switch drives every colour in the window. Rust only sets `dark`; the palettes below are
+// derived from it, so no call site has to know a colour value.
+export global Theme {
+    in-out property <bool> dark: false;
+
+    out property <color> canvas: dark ? #14181a : #f5f7f5;
+    out property <color> surface: dark ? #1c2124 : #ffffff;
+    out property <color> surface-sunken: dark ? #171c1e : #f8faf8;
+    out property <color> surface-hover: dark ? #232a2d : #f6f8f6;
+    out property <color> surface-accent: dark ? #1a2723 : #f2f6f3;
+    out property <color> surface-selected: dark ? #1e332a : #e8f3ed;
+    out property <color> border: dark ? #2c3438 : #d8dfda;
+    out property <color> border-soft: dark ? #242b2e : #e6ebe7;
+    out property <color> ink: dark ? #e8edea : #202a24;
+    out property <color> ink-muted: dark ? #c3ccc7 : #354139;
+    out property <color> ink-soft: dark ? #98a5a0 : #68736c;
+    out property <color> ink-faint: dark ? #7d8a85 : #7a857e;
+    out property <color> accent: dark ? #57c98c : #17633d;
+    out property <color> accent-strong: dark ? #6bd79c : #35875c;
+    out property <color> on-accent: dark ? #10201a : #ffffff;
+    out property <color> danger: dark ? #f08a72 : #8d3d2f;
+    out property <color> tag: dark ? #d8a877 : #7b4c2b;
+    out property <color> scrim: dark ? #05090880 : #1d2922aa;
+    // The sidebar logo tile and badges keep a solid accent behind on-accent text.
+    out property <color> accent-fill: dark ? #2f8f5c : #22784a;
+}
+
 export struct RuleRow {
-    id: string,
     name: string,
     matcher: string,
     enabled: bool,
@@ -12,13 +38,17 @@ export struct RuleRow {
 }
 
 export struct StatusRow {
-    rule-id: string,
     title: string,
     state: string,
     detail: string,
-    pid: int,
     process-count: int,
     state-color: color,
+    memory: string,
+    cpu: string,
+    // Empty when nothing is pending, e.g. a group that is already suspended.
+    countdown: string,
+    // Whether "恢复" and "本次排除" can act on this group.
+    managed: bool,
 }
 
 export struct AppRow {
@@ -31,6 +61,49 @@ export struct AppRow {
 export struct EventRow {
     time: string,
     message: string,
+    // Set for failures, so problems stand out from routine state changes.
+    is-error: bool,
+}
+
+export struct ExclusionRow {
+    process-name: string,
+    path-contains: string,
+    command-contains: string,
+}
+
+// One row of the process explorer. Sorting and filtering happen in Rust, so this list arrives in
+// the order it should be drawn.
+export struct ProcessRow {
+    pid: int,
+    name: string,
+    path: string,
+    cpu: string,
+    memory: string,
+    threads: int,
+    runtime: string,
+    status: string,
+    // Managed by one of our rules. Marks the rows where ending a process would fight a rule.
+    managed: bool,
+    suspended: bool,
+    // Index into the unfiltered sample, so a click keeps working while the list is filtered.
+    source-index: int,
+}
+
+// A member of a managed group, shown when its status card is expanded.
+export struct MemberRow {
+    pid: int,
+    name: string,
+    cpu: string,
+    memory: string,
+    depth: int,
+}
+
+// A process the rule being edited would match, shown live while typing.
+export struct PreviewRow {
+    pid: int,
+    name: string,
+    path: string,
+    excluded: bool,
 }
 
 component NavItem inherits Rectangle {
@@ -40,13 +113,13 @@ component NavItem inherits Rectangle {
     callback selected(int);
     height: 38px;
     border-radius: 6px;
-    background: current == index ? #e8f3ed : area.has-hover ? #f2f5f3 : transparent;
+    background: current == index ? Theme.surface-selected : area.has-hover ? Theme.surface-hover : transparent;
     area := TouchArea { clicked => { root.selected(index); } }
     Text {
         x: 13px;
         text: root.label;
         vertical-alignment: center;
-        color: current == index ? #17633d : #354139;
+        color: current == index ? Theme.accent : Theme.ink-muted;
         font-size: 13px;
         font-weight: current == index ? 700 : 500;
     }
@@ -59,22 +132,117 @@ component StateBadge inherits Rectangle {
     height: 24px;
     border-radius: 6px;
     background: badge-color;
-    Text { text: root.text; horizontal-alignment: center; vertical-alignment: center; color: #ffffff; font-size: 11px; font-weight: 600; }
+    // Fixed rather than themed: the background comes from Rust as a mid-tone state colour in both
+    // palettes, so light text is the readable choice either way.
+    Text { text: root.text; horizontal-alignment: center; vertical-alignment: center; color: #f4f7f5; font-size: 11px; font-weight: 600; }
 }
 
 component EmptyState inherits Rectangle {
     in property <string> title;
     in property <string> detail;
     border-width: 1px;
-    border-color: #d8dfda;
+    border-color: Theme.border;
     border-radius: 7px;
-    background: #ffffff;
+    background: Theme.surface;
     VerticalLayout {
         alignment: center;
         spacing: 7px;
-        Text { text: root.title; horizontal-alignment: center; color: #2c3630; font-size: 15px; font-weight: 600; }
-        Text { text: root.detail; horizontal-alignment: center; color: #68736c; font-size: 12px; wrap: word-wrap; }
+        Text { text: root.title; horizontal-alignment: center; color: Theme.ink; font-size: 15px; font-weight: 600; }
+        Text { text: root.detail; horizontal-alignment: center; color: Theme.ink-soft; font-size: 12px; wrap: word-wrap; }
     }
+}
+
+component FormField inherits HorizontalLayout {
+    in property <string> label;
+    // Bound, not two-way: the editor overlay is rebuilt on every open, so the binding is fresh
+    // each time and typing is never overwritten from underneath.
+    in property <string> value;
+    in property <string> placeholder;
+    callback changed(string);
+    height: 32px;
+    spacing: 8px;
+    Text {
+        width: 96px;
+        text: root.label;
+        color: Theme.ink-muted;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+    LineEdit {
+        horizontal-stretch: 1;
+        text: root.value;
+        placeholder-text: root.placeholder;
+        font-size: 11px;
+        edited(value) => { root.changed(value); }
+    }
+}
+
+// A labelled usage bar for the explorer header.
+component MetricBar inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <float> fraction;
+    in property <color> bar-color;
+    spacing: 5px;
+    HorizontalLayout {
+        Text { text: root.label; color: Theme.ink-soft; font-size: 10px; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: root.value; color: Theme.ink; font-size: 11px; font-weight: 700; }
+    }
+    Rectangle {
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.border-soft;
+        Rectangle {
+            x: 0px;
+            // Clamped so a momentary over-100% reading cannot draw outside the track.
+            width: parent.width * min(max(root.fraction, 0.0), 1.0);
+            height: parent.height;
+            border-radius: 3px;
+            background: root.bar-color;
+        }
+    }
+}
+
+// A clickable column header that shows the active sort direction.
+component ColumnHeader inherits Rectangle {
+    in property <string> label;
+    in property <int> column;
+    in property <int> active;
+    in property <bool> descending;
+    in property <TextHorizontalAlignment> align: left;
+    callback picked(int);
+    height: 26px;
+    background: area.has-hover ? Theme.surface-hover : transparent;
+    border-radius: 4px;
+    area := TouchArea { clicked => { root.picked(root.column); } }
+    Text {
+        x: 6px;
+        width: parent.width - 12px;
+        text: root.active == root.column ? root.label + (root.descending ? " ↓" : " ↑") : root.label;
+        horizontal-alignment: root.align;
+        vertical-alignment: center;
+        color: root.active == root.column ? Theme.accent : Theme.ink-soft;
+        font-size: 10px;
+        font-weight: root.active == root.column ? 700 : 600;
+        overflow: elide;
+    }
+}
+
+component SettingRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <string> hint;
+    callback decrease();
+    callback increase();
+    height: 32px;
+    spacing: 8px;
+    Text { width: 132px; text: root.label; color: Theme.ink-muted; font-size: 12px; vertical-alignment: center; }
+    Text { width: 84px; text: root.value; color: Theme.accent; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+    Button { text: "−"; clicked => { root.decrease(); } }
+    Button { text: "+"; clicked => { root.increase(); } }
+    Text { text: root.hint; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; overflow: elide; }
+    Rectangle { horizontal-stretch: 1; }
 }
 
 export component ControlPanel inherits Window {
@@ -82,7 +250,7 @@ export component ControlPanel inherits Window {
     icon: @image-url("tray-icon.svg");
     width: 980px;
     height: 680px;
-    background: #f5f7f5;
+    background: Theme.canvas;
 
     in-out property <int> page: 0;
     in-out property <int> selected-rule: -1;
@@ -104,6 +272,57 @@ export component ControlPanel inherits Window {
     in property <string> cpu-peak: "0.0%";
     in property <int> chart-process-count: 0;
     in property <int> chart-group-count: 0;
+    in property <string> event-log-path: "";
+    in property <string> sample-interval-text: "";
+    in property <string> cpu-threshold-text: "";
+    in property <string> io-threshold-text: "";
+    in property <string> chart-window-text: "";
+    // 0 system, 1 light, 2 dark. Kept separate from Theme.dark, which is the resolved value.
+    in property <int> theme-choice: 0;
+    in property <bool> pause-while-fullscreen: true;
+    in property <bool> user-busy: false;
+    in property <int> candidate-cap: 0;
+    in property <int> candidate-total: 0;
+
+    in property <[ProcessRow]> processes;
+    in property <string> process-filter: "";
+    in property <int> process-sort: 2;
+    in property <bool> process-descending: true;
+    in property <int> process-total: 0;
+    in property <string> system-cpu: "0.0%";
+    in property <float> system-cpu-fraction: 0.0;
+    in property <string> system-memory: "";
+    in property <float> system-memory-fraction: 0.0;
+    in property <string> system-summary: "";
+    in-out property <int> selected-process: -1;
+    in-out property <int> selected-process-source: -1;
+    in property <string> kill-target: "";
+    in property <string> kill-warning: "";
+    in property <string> explorer-error: "";
+
+    in-out property <int> expanded-status: -1;
+    in property <[MemberRow]> status-members;
+    in property <[PreviewRow]> draft-preview;
+    in property <int> draft-preview-total: 0;
+    in property <string> draft-preview-note: "";
+
+    in property <bool> editor-open: false;
+    in property <string> editor-title: "";
+    in property <string> editor-error: "";
+    in property <string> draft-name: "";
+    in property <string> draft-process-name: "";
+    in property <string> draft-executable-path: "";
+    in property <string> draft-path-contains: "";
+    in property <string> draft-command-contains: "";
+    in property <string> draft-command-regex: "";
+    in property <string> draft-ancestor-name: "";
+    in property <bool> draft-include-descendants: true;
+    in property <bool> draft-trim-working-set: false;
+    in property <bool> draft-schedule-enabled: false;
+    in property <string> draft-schedule-start: "00:00";
+    in property <string> draft-schedule-end: "00:00";
+    in property <int> draft-schedule-days: 0;
+    in property <[ExclusionRow]> draft-exclusions;
 
     callback set-global-enabled(bool);
     callback set-start-with-windows(bool);
@@ -116,19 +335,50 @@ export component ControlPanel inherits Window {
     callback adjust-throttle(int, int);
     callback adjust-suspend(int, int);
     callback remove-rule(int);
+    callback edit-rule(int);
+    callback new-rule();
+    callback set-draft-field(string, string);
+    callback set-draft-descendants(bool);
+    callback set-draft-trim(bool);
+    callback set-draft-schedule-enabled(bool);
+    callback toggle-draft-schedule-day(int);
+    callback set-exclusion-field(int, string, string);
+    callback add-exclusion();
+    callback remove-exclusion(int);
+    callback save-draft();
+    callback cancel-draft();
+    callback adjust-sample-interval(int);
+    callback adjust-cpu-threshold(int);
+    callback adjust-io-threshold(int);
+    callback open-event-log();
+    callback clear-event-log();
     callback add-app(int);
     callback open-config();
-    callback hide-window();
-    callback exit-app();
     callback page-selected(int);
     callback retry-save();
     callback dismiss-save-error();
+    callback set-theme(int);
+    callback set-pause-while-fullscreen(bool);
+    callback restore-presets();
+    callback export-rules();
+    callback import-rules();
+    callback browse-executable();
+    callback filter-processes(string);
+    callback sort-processes(int);
+    callback ask-kill(int);
+    callback confirm-kill();
+    callback cancel-kill();
+    callback dismiss-explorer-error();
+    callback restore-group(int);
+    callback exclude-group(int);
+    callback toggle-status(int);
+    callback add-process-rule(int);
 
     HorizontalLayout {
         spacing: 0px;
         Rectangle {
             width: 188px;
-            background: #ffffff;
+            background: Theme.surface;
             VerticalLayout {
                 padding: 14px;
                 spacing: 6px;
@@ -137,36 +387,49 @@ export component ControlPanel inherits Window {
                     HorizontalLayout {
                         spacing: 10px;
                         Rectangle {
-                            width: 36px; height: 36px; border-radius: 6px; background: #22784a;
-                            Text { text: "L"; color: white; font-size: 19px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            width: 36px; height: 36px; border-radius: 6px; background: Theme.accent-fill;
+                            Text { text: "L"; color: Theme.on-accent; font-size: 19px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "Lazy Process"; color: #202a24; font-size: 15px; font-weight: 700; }
-                            Text { text: "进程空闲调度"; color: #738078; font-size: 11px; }
+                            Text { text: "Lazy Process"; color: Theme.ink; font-size: 15px; font-weight: 700; }
+                            Text { text: "进程空闲调度"; color: Theme.ink-soft; font-size: 11px; }
                         }
                     }
                 }
                 NavItem { label: "概览"; index: 0; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "应用规则"; index: 1; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "添加应用"; index: 2; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "事件日志"; index: 3; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "进程"; index: 1; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "应用规则"; index: 2; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "添加应用"; index: 3; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "事件日志"; index: 4; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                NavItem { label: "设置"; index: 5; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
                 Rectangle { vertical-stretch: 1; }
+                if root.user-busy : Rectangle {
+                    height: 44px;
+                    background: Theme.surface-accent;
+                    border-radius: 6px;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 2px;
+                        Text { text: "检测到全屏应用"; color: Theme.tag; font-size: 11px; font-weight: 600; }
+                        Text { text: "已暂时不做任何调度"; color: Theme.ink-soft; font-size: 10px; }
+                    }
+                }
                 Rectangle {
                     height: 78px;
-                    background: #f2f6f3;
+                    background: Theme.surface-accent;
                     border-radius: 6px;
                     VerticalLayout {
                         padding: 10px;
-                        Text { text: root.globally-enabled ? "监控已启用" : "监控已暂停"; color: root.globally-enabled ? #17633d : #9a4a2d; font-size: 12px; font-weight: 600; }
-                        Text { text: root.footer-status; color: #68736c; font-size: 10px; wrap: word-wrap; }
+                        Text { text: root.globally-enabled ? "监控已启用" : "监控已暂停"; color: root.globally-enabled ? Theme.accent : Theme.danger; font-size: 12px; font-weight: 600; }
+                        Text { text: root.footer-status; color: Theme.ink-soft; font-size: 10px; wrap: word-wrap; }
                     }
                 }
             }
         }
-        Rectangle { width: 1px; background: #dce2dd; }
+        Rectangle { width: 1px; background: Theme.border; }
         Rectangle {
-            background: #f5f7f5;
+            background: Theme.canvas;
             VerticalLayout {
                 padding: 20px;
                 spacing: 14px;
@@ -176,7 +439,7 @@ export component ControlPanel inherits Window {
                     HorizontalLayout {
                         height: 36px;
                         vertical-stretch: 0;
-                        Text { text: "运行概览"; color: #202a24; font-size: 21px; font-weight: 700; vertical-alignment: center; }
+                        Text { text: "运行概览"; color: Theme.ink; font-size: 21px; font-weight: 700; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                         Button { text: "全部恢复"; clicked => { root.restore-all(); } }
                         Button { text: "按需管理员"; clicked => { root.enable-elevation(); } }
@@ -185,23 +448,23 @@ export component ControlPanel inherits Window {
                     Rectangle {
                         height: 62px;
                         vertical-stretch: 0;
-                        background: #ffffff;
+                        background: Theme.surface;
                         border-width: 1px;
-                        border-color: #d8dfda;
+                        border-color: Theme.border;
                         border-radius: 7px;
                         HorizontalLayout {
                             padding: 14px;
                             CheckBox { text: "启用自动降载"; checked: root.globally-enabled; toggled => { root.set-global-enabled(self.checked); } }
                             Rectangle { horizontal-stretch: 1; }
-                            Text { text: "恢复快捷键  Ctrl+Alt+Shift+F12"; color: #68736c; font-size: 12px; vertical-alignment: center; }
+                            Text { text: "恢复快捷键  Ctrl+Alt+Shift+F12"; color: Theme.ink-soft; font-size: 12px; vertical-alignment: center; }
                         }
                     }
                     Rectangle {
                         height: 146px;
                         vertical-stretch: 0;
-                        background: #ffffff;
+                        background: Theme.surface;
                         border-width: 1px;
-                        border-color: #d8dfda;
+                        border-color: Theme.border;
                         border-radius: 7px;
                         VerticalLayout {
                             padding: 12px;
@@ -209,17 +472,17 @@ export component ControlPanel inherits Window {
                             HorizontalLayout {
                                 height: 28px;
                                 vertical-stretch: 0;
-                                Text { text: "CPU 趋势"; color: #263129; font-size: 13px; font-weight: 700; vertical-alignment: center; }
-                                Text { text: "最近约 2 分钟"; color: #7a857e; font-size: 10px; vertical-alignment: center; }
+                                Text { text: "CPU 趋势"; color: Theme.ink; font-size: 13px; font-weight: 700; vertical-alignment: center; }
+                                Text { text: root.chart-window-text; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
                                 Rectangle { horizontal-stretch: 1; }
-                                Text { text: root.chart-group-count + " 组 · " + root.chart-process-count + " 个进程"; color: #68736c; font-size: 10px; vertical-alignment: center; }
-                                Text { text: root.cpu-current; color: #17633d; font-size: 17px; font-weight: 700; vertical-alignment: center; }
+                                Text { text: root.chart-group-count + " 组 · " + root.chart-process-count + " 个进程"; color: Theme.ink-soft; font-size: 10px; vertical-alignment: center; }
+                                Text { text: root.cpu-current; color: Theme.accent; font-size: 17px; font-weight: 700; vertical-alignment: center; }
                             }
                             chart := Rectangle {
-                                background: #f8faf8;
+                                background: Theme.surface-sunken;
                                 border-radius: 4px;
-                                Rectangle { y: parent.height / 2; height: 1px; background: #e6ebe7; }
-                                Rectangle { y: parent.height - 1px; height: 1px; background: #dce3de; }
+                                Rectangle { y: parent.height / 2; height: 1px; background: Theme.border-soft; }
+                                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border-soft; }
                                 Path {
                                     x: 4px;
                                     y: 4px;
@@ -228,11 +491,11 @@ export component ControlPanel inherits Window {
                                     commands: root.cpu-chart-path;
                                     viewbox-width: 100;
                                     viewbox-height: 40;
-                                    stroke: #278052;
+                                    stroke: Theme.accent;
                                     stroke-width: 2px;
                                     fill: transparent;
                                 }
-                                Text { x: 7px; y: 5px; text: "峰值 " + root.cpu-peak; color: #7a857e; font-size: 9px; }
+                                Text { x: 7px; y: 5px; text: "峰值 " + root.cpu-peak; color: Theme.ink-faint; font-size: 9px; }
                             }
                         }
                     }
@@ -241,23 +504,98 @@ export component ControlPanel inherits Window {
                         VerticalLayout {
                             spacing: 7px;
                             for status[i] in root.statuses : Rectangle {
-                                height: 66px;
-                                background: #ffffff;
+                                // Grows to fit the member list once the card is expanded. The
+                                // members model only ever holds the expanded group's rows.
+                                height: root.expanded-status == i
+                                    ? 104px + root.status-members.length * 22px
+                                    : 72px;
+                                background: Theme.surface;
                                 border-width: root.selected-status == i ? 2px : 1px;
-                                border-color: root.selected-status == i ? #35875c : #d8dfda;
+                                border-color: root.selected-status == i ? Theme.accent-strong : Theme.border;
                                 border-radius: 7px;
-                                TouchArea { clicked => { root.selected-status = i; } }
-                                HorizontalLayout {
+                                VerticalLayout {
                                     padding: 12px;
-                                    spacing: 12px;
-                                    VerticalLayout {
-                                        spacing: 5px;
-                                        Text { text: status.title; color: #263129; font-size: 14px; font-weight: 600; }
-                                        Text { text: status.detail; color: #68736c; font-size: 11px; overflow: elide; }
+                                    spacing: 8px;
+                                    Rectangle {
+                                        height: 44px;
+                                        TouchArea {
+                                            clicked => {
+                                                root.selected-status = i;
+                                                root.toggle-status(i);
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 12px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 4px;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    Text {
+                                                        text: root.expanded-status == i ? "▾" : "▸";
+                                                        color: Theme.ink-faint;
+                                                        font-size: 11px;
+                                                        vertical-alignment: center;
+                                                    }
+                                                    Text { text: status.title; color: Theme.ink; font-size: 14px; font-weight: 600; }
+                                                }
+                                                Text { text: status.detail; color: Theme.ink-soft; font-size: 11px; overflow: elide; }
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 3px;
+                                                Text {
+                                                    text: status.cpu + " · " + status.memory;
+                                                    color: Theme.ink-muted;
+                                                    font-size: 11px;
+                                                    horizontal-alignment: right;
+                                                }
+                                                Text {
+                                                    text: status.countdown == ""
+                                                        ? status.process-count + " 个进程"
+                                                        : status.process-count + " 个进程 · " + status.countdown;
+                                                    color: Theme.ink-faint;
+                                                    font-size: 10px;
+                                                    horizontal-alignment: right;
+                                                }
+                                            }
+                                            StateBadge { text: status.state; badge-color: status.state-color; }
+                                        }
                                     }
-                                    Rectangle { horizontal-stretch: 1; }
-                                    Text { text: status.process-count + " 个进程"; color: #68736c; font-size: 11px; vertical-alignment: center; }
-                                    StateBadge { text: status.state; badge-color: status.state-color; }
+                                    if root.expanded-status == i : Rectangle {
+                                        height: 1px;
+                                        background: Theme.border-soft;
+                                    }
+                                    if root.expanded-status == i : VerticalLayout {
+                                        spacing: 2px;
+                                        for member in root.status-members : HorizontalLayout {
+                                            height: 20px;
+                                            spacing: 8px;
+                                            // Indent marks tree depth without a second model.
+                                            Rectangle { width: 8px + member.depth * 14px; }
+                                            Text { width: 58px; text: "PID " + member.pid; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                                            Text { text: member.name; color: Theme.ink-muted; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            Text { width: 62px; text: member.cpu; color: Theme.ink-soft; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+                                            Text { width: 76px; text: member.memory; color: Theme.ink-soft; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+                                        }
+                                        HorizontalLayout {
+                                            height: 30px;
+                                            spacing: 8px;
+                                            Rectangle { horizontal-stretch: 1; }
+                                            Button {
+                                                text: "本次排除";
+                                                enabled: status.managed;
+                                                clicked => { root.exclude-group(i); }
+                                            }
+                                            Button {
+                                                text: "立即恢复";
+                                                enabled: status.managed;
+                                                clicked => { root.restore-group(i); }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -265,37 +603,216 @@ export component ControlPanel inherits Window {
                 }
 
                 if root.page == 1 : VerticalLayout {
+                    spacing: 12px;
+                    HorizontalLayout {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        Text { text: "进程"; color: Theme.ink; font-size: 21px; font-weight: 700; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "刷新"; clicked => { root.refresh-now(); } }
+                    }
+                    Rectangle {
+                        height: 74px;
+                        vertical-stretch: 0;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        border-radius: 7px;
+                        HorizontalLayout {
+                            padding: 14px;
+                            spacing: 22px;
+                            MetricBar {
+                                width: 210px;
+                                label: "CPU";
+                                value: root.system-cpu;
+                                fraction: root.system-cpu-fraction;
+                                bar-color: Theme.accent-strong;
+                            }
+                            MetricBar {
+                                width: 240px;
+                                label: "内存";
+                                value: root.system-memory;
+                                fraction: root.system-memory-fraction;
+                                bar-color: Theme.tag;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 4px;
+                                Text {
+                                    text: root.system-summary;
+                                    color: Theme.ink-muted;
+                                    font-size: 11px;
+                                    horizontal-alignment: right;
+                                }
+                                Text {
+                                    text: root.processes.length + " / " + root.process-total + " 个进程";
+                                    color: Theme.ink-faint;
+                                    font-size: 10px;
+                                    horizontal-alignment: right;
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        height: 34px;
+                        vertical-stretch: 0;
+                        spacing: 8px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            placeholder-text: "筛选进程名、路径或 PID";
+                            text: root.process-filter;
+                            edited(text) => { root.filter-processes(text); }
+                        }
+                        Button {
+                            text: "清空";
+                            enabled: root.process-filter != "";
+                            clicked => { root.filter-processes(""); }
+                        }
+                        Button {
+                            text: "加为规则";
+                            enabled: root.selected-process-source >= 0;
+                            clicked => { root.add-process-rule(root.selected-process-source); }
+                        }
+                        Button {
+                            text: "结束进程";
+                            enabled: root.selected-process-source >= 0;
+                            clicked => { root.ask-kill(root.selected-process-source); }
+                        }
+                    }
+                    if root.processes.length == 0 : EmptyState {
+                        title: root.process-filter == "" ? "还没有采样数据" : "没有匹配进程";
+                        detail: root.process-filter == "" ? "第一次采样完成后会列出全部进程。" : "换一个关键词，或用 PID 精确查找。";
+                    }
+                    if root.processes.length > 0 : Rectangle {
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        border-radius: 7px;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                height: 26px;
+                                vertical-stretch: 0;
+                                spacing: 6px;
+                                ColumnHeader { width: 62px; label: "PID"; column: 0; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { horizontal-stretch: 1; label: "名称"; column: 1; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { width: 68px; label: "CPU"; column: 2; align: right; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { width: 82px; label: "内存"; column: 3; align: right; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { width: 54px; label: "线程"; column: 4; align: right; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { width: 74px; label: "运行"; column: 5; align: right; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                                ColumnHeader { width: 72px; label: "状态"; column: 6; active: root.process-sort; descending: root.process-descending; picked(c) => { root.sort-processes(c); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.border-soft; }
+                            process-list := ListView {
+                                for row[i] in root.processes : Rectangle {
+                                    width: process-list.width;
+                                    height: 30px;
+                                    background: root.selected-process == i
+                                        ? Theme.surface-selected
+                                        : row-area.has-hover ? Theme.surface-hover : transparent;
+                                    border-radius: 4px;
+                                    row-area := TouchArea {
+                                        clicked => {
+                                            root.selected-process = i;
+                                            root.selected-process-source = row.source-index;
+                                        }
+                                        double-clicked => {
+                                            root.selected-process = i;
+                                            root.selected-process-source = row.source-index;
+                                            root.ask-kill(row.source-index);
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { width: 62px; text: row.pid; color: Theme.ink-faint; font-size: 11px; vertical-alignment: center; }
+                                        HorizontalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 6px;
+                                            Text {
+                                                text: row.name;
+                                                color: Theme.ink;
+                                                font-size: 11px;
+                                                font-weight: row.managed ? 700 : 400;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            if row.managed : Text {
+                                                text: "受管";
+                                                color: Theme.accent;
+                                                font-size: 9px;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                        Text { width: 68px; text: row.cpu; color: Theme.ink-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text { width: 82px; text: row.memory; color: Theme.ink-muted; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text { width: 54px; text: row.threads; color: Theme.ink-soft; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text { width: 74px; text: row.runtime; color: Theme.ink-soft; font-size: 10px; horizontal-alignment: right; vertical-alignment: center; }
+                                        Text {
+                                            width: 72px;
+                                            text: row.status;
+                                            color: row.suspended ? Theme.tag : Theme.ink-soft;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "单击选中，双击直接询问是否结束。结束进程无法撤销，受管进程会先被规则恢复。";
+                                color: Theme.ink-faint;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                if root.page == 2 : VerticalLayout {
                     spacing: 13px;
-                    Text { text: "应用规则"; color: #202a24; font-size: 21px; font-weight: 700; }
-                    Text { text: "一级降载降低优先级并启用 Efficiency Mode；二级暂停必须逐条显式允许。"; color: #68736c; font-size: 12px; }
-                    if root.rules.length == 0 : EmptyState { title: "没有规则"; detail: "从“添加应用”选择一个正在运行的应用。"; }
+                    HorizontalLayout {
+                        height: 36px;
+                        vertical-stretch: 0;
+                        Text { text: "应用规则"; color: Theme.ink; font-size: 21px; font-weight: 700; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "恢复预设"; clicked => { root.restore-presets(); } }
+                        Button { text: "导入"; clicked => { root.import-rules(); } }
+                        Button { text: "导出"; clicked => { root.export-rules(); } }
+                        Button { text: "新建规则"; primary: true; clicked => { root.new-rule(); } }
+                    }
+                    Text { text: "一级降载降低优先级并启用 Efficiency Mode；二级暂停必须逐条显式允许。点击“编辑”可设置进程名、路径、命令行与排除条件。"; color: Theme.ink-soft; font-size: 12px; wrap: word-wrap; }
+                    if root.rules.length == 0 : EmptyState { title: "没有规则"; detail: "点击“新建规则”，或从“添加应用”选择一个正在运行的应用。"; }
                     if root.rules.length > 0 : ScrollView {
                         VerticalLayout {
                             spacing: 8px;
                             for rule[i] in root.rules : Rectangle {
                                 height: 112px;
-                                background: #ffffff;
+                                background: Theme.surface;
                                 border-width: root.selected-rule == i ? 2px : 1px;
-                                border-color: root.selected-rule == i ? #35875c : #d8dfda;
+                                border-color: root.selected-rule == i ? Theme.accent-strong : Theme.border;
                                 border-radius: 7px;
                                 TouchArea { clicked => { root.selected-rule = i; } }
                                 VerticalLayout {
                                     padding: 12px;
                                     spacing: 7px;
                                     HorizontalLayout {
-                                        Text { text: rule.name; color: #263129; font-size: 14px; font-weight: 700; }
-                                        Text { text: rule.built-in ? "预设" : "自定义"; color: #7b4c2b; font-size: 10px; vertical-alignment: center; }
+                                        Text { text: rule.name; color: Theme.ink; font-size: 14px; font-weight: 700; }
+                                        Text { text: rule.built-in ? "预设" : "自定义"; color: Theme.tag; font-size: 10px; vertical-alignment: center; }
                                         Rectangle { horizontal-stretch: 1; }
+                                        Button { text: "编辑"; clicked => { root.edit-rule(i); } }
                                         Button { text: rule.enabled ? "停用" : "启用"; clicked => { root.set-rule-enabled(i, !rule.enabled); } }
                                         Button { text: "删除"; enabled: !rule.built-in; clicked => { root.remove-rule(i); } }
                                     }
-                                    Text { text: rule.matcher; color: #68736c; font-size: 11px; overflow: elide; }
+                                    Text { text: rule.matcher; color: Theme.ink-soft; font-size: 11px; overflow: elide; }
                                     HorizontalLayout {
                                         spacing: 8px;
-                                        Text { text: "低耗 " + rule.throttle-minutes + " 分钟"; color: #354139; font-size: 11px; vertical-alignment: center; }
+                                        Text { text: "低耗 " + rule.throttle-minutes + " 分钟"; color: Theme.ink-muted; font-size: 11px; vertical-alignment: center; }
                                         Button { text: "−"; clicked => { root.adjust-throttle(i, -1); } }
                                         Button { text: "+"; clicked => { root.adjust-throttle(i, 1); } }
-                                        Text { text: "暂停 " + rule.suspend-minutes + " 分钟"; color: #354139; font-size: 11px; vertical-alignment: center; }
+                                        Text { text: "暂停 " + rule.suspend-minutes + " 分钟"; color: Theme.ink-muted; font-size: 11px; vertical-alignment: center; }
                                         Button { text: "−"; clicked => { root.adjust-suspend(i, -5); } }
                                         Button { text: "+"; clicked => { root.adjust-suspend(i, 5); } }
                                         Rectangle { horizontal-stretch: 1; }
@@ -307,14 +824,21 @@ export component ControlPanel inherits Window {
                     }
                 }
 
-                if root.page == 2 : VerticalLayout {
+                if root.page == 3 : VerticalLayout {
                     spacing: 13px;
                     HorizontalLayout {
-                        Text { text: "添加正在运行的应用"; color: #202a24; font-size: 21px; font-weight: 700; }
+                        Text { text: "添加正在运行的应用"; color: Theme.ink; font-size: 21px; font-weight: 700; }
                         Rectangle { horizontal-stretch: 1; }
+                        Button { text: "选择程序…"; clicked => { root.browse-executable(); } }
                         Button { text: "刷新"; clicked => { root.refresh-now(); } }
                     }
-                    Text { text: "选择后将按完整可执行路径创建规则；同名但来自其他宿主的进程不会被包含。"; color: #68736c; font-size: 12px; }
+                    Text { text: "选择后将按完整可执行路径创建规则；同名但来自其他宿主的进程不会被包含。未运行的程序可用“选择程序…”从磁盘添加。"; color: Theme.ink-soft; font-size: 12px; wrap: word-wrap; }
+                    if root.candidate-total > root.candidate-cap : Text {
+                        text: "结果较多，仅显示前 " + root.candidate-cap + " 项，共 " + root.candidate-total + " 项。缩小筛选条件可看到其余结果。";
+                        color: Theme.tag;
+                        font-size: 10px;
+                        wrap: word-wrap;
+                    }
                     HorizontalLayout {
                         height: 36px;
                         vertical-stretch: 0;
@@ -325,7 +849,7 @@ export component ControlPanel inherits Window {
                             text <=> root.app-filter;
                             edited(text) => { root.filter-apps(text); }
                         }
-                        Text { text: root.apps.length + " 个结果"; color: #68736c; font-size: 10px; vertical-alignment: center; }
+                        Text { text: root.apps.length + " 个结果"; color: Theme.ink-soft; font-size: 10px; vertical-alignment: center; }
                         Button {
                             text: "清空";
                             enabled: root.app-filter != "";
@@ -340,9 +864,9 @@ export component ControlPanel inherits Window {
                         detail: root.app-filter == "" ? "刷新后仍为空时，请先启动需要管理的应用。" : "尝试缩短关键词，或改用进程名、路径和 PID。";
                     }
                     if root.apps.length > 0 : Rectangle {
-                        background: #ffffff;
+                        background: Theme.surface;
                         border-width: 1px;
-                        border-color: #d8dfda;
+                        border-color: Theme.border;
                         border-radius: 7px;
                         VerticalLayout {
                             padding: 12px;
@@ -350,7 +874,7 @@ export component ControlPanel inherits Window {
                                 for app[i] in root.apps : Rectangle {
                                     width: app-list.width;
                                     height: 56px;
-                                    background: root.selected-app == i ? #e8f3ed : app-row-area.has-hover ? #f6f8f6 : #ffffff;
+                                    background: root.selected-app == i ? Theme.surface-selected : app-row-area.has-hover ? Theme.surface-hover : Theme.surface;
 
                                     app-row-area := TouchArea {
                                         clicked => {
@@ -375,16 +899,16 @@ export component ControlPanel inherits Window {
                                             horizontal-stretch: 1;
                                             alignment: center;
                                             spacing: 3px;
-                                            Text { text: app.name; color: #263129; font-size: 13px; font-weight: 600; overflow: elide; }
-                                            Text { text: app.path; color: #738078; font-size: 10px; overflow: elide; }
+                                            Text { text: app.name; color: Theme.ink; font-size: 13px; font-weight: 600; overflow: elide; }
+                                            Text { text: app.path; color: Theme.ink-soft; font-size: 10px; overflow: elide; }
                                         }
-                                        Text { text: "PID " + app.pid; color: #68736c; font-size: 10px; vertical-alignment: center; }
+                                        Text { text: "PID " + app.pid; color: Theme.ink-soft; font-size: 10px; vertical-alignment: center; }
                                     }
 
                                     Rectangle {
                                         y: parent.height - 1px;
                                         height: 1px;
-                                        background: #e6ebe7;
+                                        background: Theme.border-soft;
                                     }
                                 }
                             }
@@ -398,32 +922,523 @@ export component ControlPanel inherits Window {
                     }
                 }
 
-                if root.page == 3 : VerticalLayout {
+                if root.page == 4 : VerticalLayout {
                     spacing: 13px;
-                    Text { text: "事件日志"; color: #202a24; font-size: 21px; font-weight: 700; }
-                    Text { text: "仅记录状态变化和错误，不保存终端输出或完整命令行。"; color: #68736c; font-size: 12px; }
+                    Text { text: "事件日志"; color: Theme.ink; font-size: 21px; font-weight: 700; }
+                    Text { text: "仅记录状态变化和错误，不保存终端输出或完整命令行。"; color: Theme.ink-soft; font-size: 12px; }
                     if root.events.length == 0 : EmptyState { title: "还没有事件"; detail: "进入低耗、暂停、恢复和权限错误时会出现在这里。"; }
                     if root.events.length > 0 : ScrollView {
                         VerticalLayout {
                             spacing: 1px;
                             for event in root.events : Rectangle {
                                 height: 38px;
-                                background: #ffffff;
+                                background: event.is-error ? Theme.surface-sunken : Theme.surface;
                                 HorizontalLayout {
                                     padding-left: 10px; padding-right: 10px;
-                                    Text { width: 76px; text: event.time; color: #7a857e; font-size: 10px; vertical-alignment: center; }
-                                    Text { text: event.message; color: #354139; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                    spacing: 6px;
+                                    Text { width: 76px; text: event.time; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                                    if event.is-error : Text { text: "!"; color: Theme.danger; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+                                    Text {
+                                        text: event.message;
+                                        color: event.is-error ? Theme.danger : Theme.ink-muted;
+                                        font-size: 11px;
+                                        font-weight: event.is-error ? 600 : 400;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
                                 }
                             }
                         }
                     }
-                    Rectangle { height: 1px; background: #d8dfda; }
+                    Rectangle { height: 1px; background: Theme.border; }
                     HorizontalLayout {
-                        Text { text: root.config-path; color: #7a857e; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                        height: 28px;
+                        vertical-stretch: 0;
+                        Text { text: root.event-log-path; color: Theme.ink-faint; font-size: 10px; overflow: elide; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        CheckBox { text: "开机启动"; checked: root.start-with-windows; toggled => { root.set-start-with-windows(self.checked); } }
-                        Button { text: "打开配置"; clicked => { root.open-config(); } }
+                        Text { text: "重启后会载入最近的记录"; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
                     }
+                }
+
+                if root.page == 5 : VerticalLayout {
+                    spacing: 13px;
+                    Text { text: "设置"; color: Theme.ink; font-size: 21px; font-weight: 700; }
+                    Text { text: "阈值对所有规则生效：一个进程组的 CPU 与 I/O 必须同时低于阈值才开始累计静默时间。"; color: Theme.ink-soft; font-size: 12px; wrap: word-wrap; }
+                    Rectangle {
+                        height: 148px;
+                        vertical-stretch: 0;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        border-radius: 7px;
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+                            SettingRow {
+                                label: "采样间隔";
+                                value: root.sample-interval-text;
+                                hint: "1 到 10 秒，空闲时自动退避";
+                                decrease => { root.adjust-sample-interval(-1); }
+                                increase => { root.adjust-sample-interval(1); }
+                            }
+                            SettingRow {
+                                label: "CPU 静默阈值";
+                                value: root.cpu-threshold-text;
+                                hint: "整组占用低于该值才算静默";
+                                decrease => { root.adjust-cpu-threshold(-1); }
+                                increase => { root.adjust-cpu-threshold(1); }
+                            }
+                            SettingRow {
+                                label: "I/O 静默阈值";
+                                value: root.io-threshold-text;
+                                hint: "每次采样之间允许的读写量";
+                                decrease => { root.adjust-io-threshold(-1); }
+                                increase => { root.adjust-io-threshold(1); }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 66px;
+                        vertical-stretch: 0;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        border-radius: 7px;
+                        HorizontalLayout {
+                            padding: 14px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 3px;
+                                Text { text: "界面主题"; color: Theme.ink-muted; font-size: 12px; }
+                                Text { text: "“跟随系统”读取 Windows 的浅色/深色设置"; color: Theme.ink-faint; font-size: 10px; }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            for option[i] in ["跟随系统", "浅色", "深色"] : Rectangle {
+                                width: 78px;
+                                height: 30px;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: root.theme-choice == i ? Theme.accent-strong : Theme.border;
+                                background: root.theme-choice == i
+                                    ? Theme.surface-selected
+                                    : theme-area.has-hover ? Theme.surface-hover : Theme.surface;
+                                theme-area := TouchArea { clicked => { root.set-theme(i); } }
+                                Text {
+                                    text: option;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    color: root.theme-choice == i ? Theme.accent : Theme.ink-muted;
+                                    font-size: 11px;
+                                    font-weight: root.theme-choice == i ? 700 : 500;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 162px;
+                        vertical-stretch: 0;
+                        background: Theme.surface;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        border-radius: 7px;
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 10px;
+                            HorizontalLayout {
+                                height: 26px;
+                                CheckBox { text: "开机启动"; checked: root.start-with-windows; toggled => { root.set-start-with-windows(self.checked); } }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: "启动时会与注册表实际状态核对"; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                            }
+                            HorizontalLayout {
+                                height: 26px;
+                                CheckBox {
+                                    text: "全屏或演示时不做调度";
+                                    checked: root.pause-while-fullscreen;
+                                    toggled => { root.set-pause-while-fullscreen(self.checked); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: "游戏和放映期间后台进程看起来都是空闲的"; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                            }
+                            HorizontalLayout {
+                                height: 32px;
+                                spacing: 8px;
+                                Text { text: root.config-path; color: Theme.ink-faint; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button { text: "打开配置"; clicked => { root.open-config(); } }
+                            }
+                            HorizontalLayout {
+                                height: 32px;
+                                spacing: 8px;
+                                Text { text: root.event-log-path; color: Theme.ink-faint; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button { text: "打开日志"; clicked => { root.open-event-log(); } }
+                                Button { text: "清空日志"; clicked => { root.clear-event-log(); } }
+                            }
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
+    }
+
+    if root.editor-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        z: 9;
+        // Swallows clicks so the pages behind the dialog cannot be operated while it is open.
+        TouchArea {}
+        // Enter saves and Escape cancels, matching every other dialog on Windows. The scope wraps
+        // the dialog so keys a focused field does not consume still reach it.
+        editor-keys := FocusScope {
+            x: (parent.width - 660px) / 2;
+            y: (parent.height - 640px) / 2;
+            width: 660px;
+            height: 640px;
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.cancel-draft();
+                    return accept;
+                }
+                if (event.text == Key.Return) {
+                    root.save-draft();
+                    return accept;
+                }
+                return reject;
+            }
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 9px;
+                Text { text: root.editor-title; color: Theme.ink; font-size: 17px; font-weight: 700; }
+                Text {
+                    text: "进程名、完整路径、路径包含、命令行包含、命令行正则 至少填写一项；祖先进程名只能作为附加条件。留空表示不限制。";
+                    color: Theme.ink-soft;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 7px;
+                        FormField {
+                            label: "规则名称";
+                            value: root.draft-name;
+                            placeholder: "显示在列表中的名称";
+                            changed(value) => { root.set-draft-field("name", value); }
+                        }
+                        FormField {
+                            label: "进程名";
+                            value: root.draft-process-name;
+                            placeholder: "例如 code.exe";
+                            changed(value) => { root.set-draft-field("process-name", value); }
+                        }
+                        FormField {
+                            label: "完整路径";
+                            value: root.draft-executable-path;
+                            placeholder: "例如 C:\\Program Files\\App\\app.exe";
+                            changed(value) => { root.set-draft-field("executable-path", value); }
+                        }
+                        FormField {
+                            label: "路径包含";
+                            value: root.draft-path-contains;
+                            placeholder: "可执行文件路径中的片段";
+                            changed(value) => { root.set-draft-field("path-contains", value); }
+                        }
+                        FormField {
+                            label: "命令行包含";
+                            value: root.draft-command-contains;
+                            placeholder: "启动参数中的片段";
+                            changed(value) => { root.set-draft-field("command-contains", value); }
+                        }
+                        FormField {
+                            label: "命令行正则";
+                            value: root.draft-command-regex;
+                            placeholder: "正则表达式，保存前会校验";
+                            changed(value) => { root.set-draft-field("command-regex", value); }
+                        }
+                        FormField {
+                            label: "祖先进程名";
+                            value: root.draft-ancestor-name;
+                            placeholder: "例如 WindowsTerminal.exe";
+                            changed(value) => { root.set-draft-field("ancestor-name", value); }
+                        }
+                        HorizontalLayout {
+                            height: 28px;
+                            CheckBox {
+                                text: "同时管理子进程树";
+                                checked: root.draft-include-descendants;
+                                toggled => { root.set-draft-descendants(self.checked); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        HorizontalLayout {
+                            height: 28px;
+                            spacing: 8px;
+                            CheckBox {
+                                text: "暂停后回收工作集内存";
+                                checked: root.draft-trim-working-set;
+                                toggled => { root.set-draft-trim(self.checked); }
+                            }
+                            Text {
+                                text: "把内存写入页面文件，恢复时会重新读入，首次操作会变慢";
+                                color: Theme.ink-faint;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        HorizontalLayout {
+                            height: 28px;
+                            spacing: 8px;
+                            CheckBox {
+                                text: "仅在指定时段生效";
+                                checked: root.draft-schedule-enabled;
+                                toggled => { root.set-draft-schedule-enabled(self.checked); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        if root.draft-schedule-enabled : VerticalLayout {
+                            spacing: 6px;
+                            FormField {
+                                label: "开始时间";
+                                value: root.draft-schedule-start;
+                                placeholder: "HH:MM，例如 22:00";
+                                changed(value) => { root.set-draft-field("schedule-start", value); }
+                            }
+                            FormField {
+                                label: "结束时间";
+                                value: root.draft-schedule-end;
+                                placeholder: "HH:MM，跨零点写 06:00";
+                                changed(value) => { root.set-draft-field("schedule-end", value); }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 5px;
+                                Text { width: 96px; text: "生效日"; color: Theme.ink-muted; font-size: 11px; vertical-alignment: center; }
+                                for day[i] in ["日", "一", "二", "三", "四", "五", "六"] : Rectangle {
+                                    width: 32px;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    // Bit i of the mask. Zero means every day, which reads as all
+                                    // seven selected rather than none.
+                                    property <bool> on: root.draft-schedule-days == 0
+                                        || Math.mod(Math.floor(root.draft-schedule-days / Math.pow(2, i)), 2) == 1;
+                                    border-color: on ? Theme.accent-strong : Theme.border;
+                                    background: on ? Theme.surface-selected : Theme.surface;
+                                    TouchArea { clicked => { root.toggle-draft-schedule-day(i); } }
+                                    Text {
+                                        text: day;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        color: on ? Theme.accent : Theme.ink-faint;
+                                        font-size: 11px;
+                                        font-weight: on ? 700 : 400;
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+                        Rectangle { height: 1px; background: Theme.border-soft; }
+                        HorizontalLayout {
+                            height: 26px;
+                            spacing: 8px;
+                            Text { text: "实时预览"; color: Theme.ink; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+                            Text {
+                                text: root.draft-preview-note;
+                                color: Theme.ink-faint;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                        if root.draft-preview.length == 0 : Text {
+                            text: "当前没有匹配的进程。条件可以先保存，等应用启动后再生效。";
+                            color: Theme.ink-faint;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                        for match in root.draft-preview : HorizontalLayout {
+                            height: 20px;
+                            spacing: 8px;
+                            Text { width: 58px; text: "PID " + match.pid; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                            Text {
+                                width: 130px;
+                                text: match.name;
+                                color: match.excluded ? Theme.ink-faint : Theme.ink-muted;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: match.excluded ? "已排除" : match.path;
+                                color: match.excluded ? Theme.tag : Theme.ink-faint;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 8px;
+                            Text { text: "排除条件"; color: Theme.ink; font-size: 12px; font-weight: 700; vertical-alignment: center; }
+                            Text { text: "命中任一排除条件的进程不会被管理"; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button { text: "添加排除"; clicked => { root.add-exclusion(); } }
+                        }
+                        for exclusion[i] in root.draft-exclusions : Rectangle {
+                            height: 132px;
+                            background: Theme.surface-sunken;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: Theme.border-soft;
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 5px;
+                                HorizontalLayout {
+                                    height: 22px;
+                                    Text { text: "排除 " + (i + 1); color: Theme.ink-muted; font-size: 11px; font-weight: 600; vertical-alignment: center; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Button { text: "删除"; clicked => { root.remove-exclusion(i); } }
+                                }
+                                FormField {
+                                    label: "进程名";
+                                    value: exclusion.process-name;
+                                    changed(value) => { root.set-exclusion-field(i, "process-name", value); }
+                                }
+                                FormField {
+                                    label: "路径包含";
+                                    value: exclusion.path-contains;
+                                    changed(value) => { root.set-exclusion-field(i, "path-contains", value); }
+                                }
+                                FormField {
+                                    label: "命令行包含";
+                                    value: exclusion.command-contains;
+                                    changed(value) => { root.set-exclusion-field(i, "command-contains", value); }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.editor-error != "" : Text {
+                    text: root.editor-error;
+                    color: Theme.danger;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    Text { text: "Enter 保存 · Esc 取消"; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "取消"; clicked => { root.cancel-draft(); } }
+                    Button { text: "保存"; primary: true; clicked => { root.save-draft(); } }
+                }
+            }
+        }
+        }
+    }
+
+    if root.kill-target != "" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        z: 11;
+        TouchArea {}
+        kill-keys := FocusScope {
+            x: (parent.width - 460px) / 2;
+            y: (parent.height - 230px) / 2;
+            width: 460px;
+            height: 230px;
+            init => { self.focus(); }
+            // Escape cancels. Enter deliberately does not confirm: an irreversible action should
+            // need a deliberate click, not a stray keypress.
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.cancel-kill();
+                    return accept;
+                }
+                return reject;
+            }
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: "结束进程"; color: Theme.danger; font-size: 17px; font-weight: 700; }
+                Text { text: root.kill-target; color: Theme.ink; font-size: 12px; font-weight: 600; wrap: word-wrap; }
+                Text {
+                    text: "未保存的数据会丢失，操作无法撤销。";
+                    color: Theme.ink-soft;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                if root.kill-warning != "" : Text {
+                    text: root.kill-warning;
+                    color: Theme.tag;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "取消"; clicked => { root.cancel-kill(); } }
+                    Button { text: "确认结束"; clicked => { root.confirm-kill(); } }
+                }
+            }
+        }
+        }
+    }
+
+    if root.explorer-error != "" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        z: 12;
+        TouchArea {}
+        Rectangle {
+            x: (parent.width - 430px) / 2;
+            y: (parent.height - 190px) / 2;
+            width: 430px;
+            height: 190px;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: "操作未完成"; color: Theme.danger; font-size: 17px; font-weight: 700; }
+                Text { text: root.explorer-error; color: Theme.ink-muted; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "关闭"; clicked => { root.dismiss-explorer-error(); } }
                 }
             }
         }
@@ -434,22 +1449,23 @@ export component ControlPanel inherits Window {
         y: 0px;
         width: parent.width;
         height: parent.height;
-        background: #1d2922aa;
+        background: Theme.scrim;
         z: 10;
+        TouchArea {}
         Rectangle {
             x: (parent.width - 430px) / 2;
             y: (parent.height - 190px) / 2;
             width: 430px;
             height: 190px;
-            background: #ffffff;
+            background: Theme.surface;
             border-width: 1px;
-            border-color: #d8dfda;
+            border-color: Theme.border;
             border-radius: 7px;
             VerticalLayout {
                 padding: 20px;
                 spacing: 10px;
-                Text { text: "配置保存失败"; color: #8d3d2f; font-size: 17px; font-weight: 700; }
-                Text { text: root.save-error; color: #354139; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
+                Text { text: "配置保存失败"; color: Theme.danger; font-size: 17px; font-weight: 700; }
+                Text { text: root.save-error; color: Theme.ink-muted; font-size: 11px; wrap: word-wrap; vertical-stretch: 1; }
                 HorizontalLayout {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
@@ -463,8 +1479,9 @@ export component ControlPanel inherits Window {
 }
 
 export component AppTray inherits SystemTrayIcon {
+    in property <string> tray-tooltip: "Lazy Process";
     icon: @image-url("tray-icon.svg");
-    tooltip: "Lazy Process";
+    tooltip: root.tray-tooltip;
     Menu {
         MenuItem { title: "打开 Lazy Process"; activated => { root.open(); } }
         MenuItem { title: "全部恢复"; activated => { root.restore-all(); } }

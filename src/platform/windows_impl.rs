@@ -1253,12 +1253,12 @@ fn start_elevated_broker(journal_path: &Path) -> Result<ElevatedBroker, String> 
     let parent_pid = std::process::id();
     let parent_started_at_ticks =
         exact_process_start_ticks(parent_pid).ok_or_else(|| "无法确认主进程启动时间".to_owned())?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let pipe_name = format!(r"\\.\pipe\lazy-process-{parent_pid}-{nonce:x}");
-    let cancel_event_name = format!("Local\\LazyProcessHelperCancel-{parent_pid}-{nonce:x}");
-    let ready_event_name = format!("Local\\LazyProcessHelperReady-{parent_pid}-{nonce:x}");
+    // Unguessable: the pipe carries elevated actions, so a hostile process must not
+    // be able to predict the name and race the main process to connect.
+    let nonce = random_u128().map_err(|error| error.to_string())?;
+    let pipe_name = format!(r"\\.\pipe\lazy-process-{parent_pid}-{nonce:032x}");
+    let cancel_event_name = format!("Local\\LazyProcessHelperCancel-{parent_pid}-{nonce:032x}");
+    let ready_event_name = format!("Local\\LazyProcessHelperReady-{parent_pid}-{nonce:032x}");
     let cancel_event = create_cross_account_event(&cancel_event_name)?;
     let ready_event = create_cross_account_event(&ready_event_name)?;
     let elevated_journal = elevated_journal_path(journal_path);
@@ -1895,26 +1895,33 @@ impl WatchdogRecovery {
     }
 }
 
-fn watchdog_ready_event_name() -> io::Result<String> {
-    let mut nonce = [0_u8; size_of::<u128>()];
+/// Unguessable 128-bit value for object names a hostile process must not be able
+/// to predict. Callers that only need uniqueness within one directory can use a
+/// cheaper source.
+fn random_u128() -> io::Result<u128> {
+    let mut bytes = [0_u8; size_of::<u128>()];
     let status = unsafe {
         BCryptGenRandom(
             std::ptr::null_mut(),
-            nonce.as_mut_ptr(),
-            u32::try_from(nonce.len()).unwrap_or(u32::MAX),
+            bytes.as_mut_ptr(),
+            u32::try_from(bytes.len()).unwrap_or(u32::MAX),
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
     };
     if status < 0 {
         return Err(io::Error::other(format!(
-            "无法生成 watchdog 就绪事件随机名称：NTSTATUS 0x{:08x}",
+            "无法生成随机对象名称：NTSTATUS 0x{:08x}",
             status.cast_unsigned()
         )));
     }
+    Ok(u128::from_le_bytes(bytes))
+}
+
+fn watchdog_ready_event_name() -> io::Result<String> {
     Ok(format!(
         "Local\\LazyProcessWatchdogReady-{}-{:032x}",
         std::process::id(),
-        u128::from_le_bytes(nonce)
+        random_u128()?
     ))
 }
 

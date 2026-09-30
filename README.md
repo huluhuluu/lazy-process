@@ -37,7 +37,9 @@ cargo build --release
 Run `target/release/lazy-process.exe`. Configuration, the recovery journal, and a
 rolling event log are stored under the current user's local application data
 directory. Launching a second copy activates the running instance instead of
-starting another tray icon.
+starting another tray icon. If the configuration file cannot be read, monitoring
+stays off and writes are refused rather than replacing the file with defaults, so
+a corrupted or hand-edited file never costs you the rules in it.
 
 ## Rules
 
@@ -51,16 +53,21 @@ are preserved on save.
 While a rule is being edited, a live preview lists the processes it would match
 right now, marking each as a host, a descendant, or excluded. Rules can be
 exported to and imported from a JSON file; an imported rule that collides with an
-existing id is renamed rather than overwriting it. Deleted presets can be brought
-back from the rules page without touching anything else.
+existing id is renamed rather than overwriting it, and an import that would not
+validate is rejected before anything is written, so a bad file cannot cost you the
+rules you already had. Deleted presets can be brought back from the rules page
+without touching anything else.
 
 Two optional per-rule settings:
 
 - **Schedule.** Restricts a rule to a time window and a set of weekdays. Windows
-  that wrap past midnight are supported, so 22:00–06:00 means the night. Leaving
-  the window empty means the whole day, and clearing every weekday means every
-  day, so a half-filled schedule cannot silently disable a rule. Anything the
-  rule was managing is restored when its window closes.
+  that wrap past midnight are supported, so 22:00–06:00 means the night, and a
+  weekday applies to the night it starts: "Monday, 22:00–06:00" runs from Monday
+  evening through to 06:00 on Tuesday, rather than being cut in half at midnight.
+  Leaving the window empty means the whole day, and clearing every weekday means
+  every day, so a half-filled schedule cannot silently disable a rule. A weekday
+  mask with no day in it is rejected on load instead of quietly disabling the
+  rule. Anything the rule was managing is restored when its window closes.
 - **Working-set trimming.** After a group is suspended, flushes its resident
   memory to the page file. Off by default and opt-in per rule: it gives back more
   memory, at the cost of a slower first moment after the application resumes.
@@ -70,15 +77,23 @@ Two optional per-rule settings:
 ## Process page
 
 A full process list with system CPU and memory bars, sortable by PID, name, CPU,
-memory, thread count, run time, or status. Threads come from a single toolhelp
-snapshot per sample rather than a handle per process. Processes managed by a rule
-are marked, and the rows filter on name, path, or PID.
+memory, thread count, run time, or status. Threads and suspension state come from
+one `NtQuerySystemInformation` call per sample rather than a handle per process,
+so a process suspended by anything — Lazy Process or another tool — is shown as
+paused. A toolhelp snapshot is the fallback if that query is unavailable.
+Processes managed by a rule are marked, and the rows filter on name, path, or
+PID.
 
-Selecting a row allows two things: creating a path rule for it, or ending it. An
-expanded status card on the overview page lists a group's process tree with its
-per-process CPU and memory, plus the countdown to the next action, and can
-restore that one group or exclude it for the rest of the run. A session exclusion
-lasts until that process exits; an exclusion that should outlive a restart
+Selecting a row allows two things: creating a path rule for it, or ending it.
+Both act on the selected PID and revalidate the process identity first, so a
+sample refreshed between the click and the action cannot redirect it at another
+process. An expanded status card on the overview page lists a group's process
+tree with its per-process CPU and memory, plus the countdown to the next action,
+and can restore that one group or exclude it for the rest of the run. That
+restore and exclusion are addressed by the group's root PID for the same reason:
+the status list is rebuilt every tick, so a stored row number could name a
+different group by the time the button is pressed. A session
+exclusion lasts until that process exits; an exclusion that should outlive a restart
 belongs in the rule.
 
 ## Global settings

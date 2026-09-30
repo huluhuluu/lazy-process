@@ -22,6 +22,7 @@ use std::{
 };
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows::{
+    Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation},
     Win32::{
         Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_PIPE_CONNECTED,
@@ -62,6 +63,7 @@ use windows::{
                 QueryFullProcessImageNameW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent,
                 SetPriorityClass, SetProcessInformation, TerminateProcess, WaitForSingleObject,
             },
+            WindowsProgramming::{SYSTEM_PROCESS_INFORMATION, SYSTEM_THREAD_INFORMATION},
         },
         UI::Shell::{
             QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SEE_MASK_FLAG_NO_UI,
@@ -206,12 +208,21 @@ impl ProcessSampler {
             });
         }
         self.metadata.retain(|key, _| present.contains(key));
-        // sysinfo does not expose a thread count on Windows, so fill it in from a single toolhelp
-        // snapshot rather than opening one handle per process.
-        let threads = thread_counts();
-        if !threads.is_empty() {
+        // One system-wide query fills in both the thread counts and which processes something else
+        // has suspended. sysinfo exposes neither, and a per-process handle would be far more
+        // expensive. The toolhelp snapshot stays as the fallback if the query is unavailable.
+        if let Some(info) = system_process_info() {
             for sample in &mut samples {
-                sample.thread_count = threads.get(&sample.identity.pid).copied().unwrap_or(0);
+                let pid = sample.identity.pid;
+                sample.thread_count = info.thread_counts.get(&pid).copied().unwrap_or(0);
+                sample.os_suspended = info.suspended.contains(&pid);
+            }
+        } else {
+            let threads = thread_counts();
+            if !threads.is_empty() {
+                for sample in &mut samples {
+                    sample.thread_count = threads.get(&sample.identity.pid).copied().unwrap_or(0);
+                }
             }
         }
         samples
@@ -267,6 +278,127 @@ fn thread_counts() -> HashMap<u32, u32> {
         }
     }
     counts
+}
+
+/// Thread state `Waiting` and wait reason `Suspended`, from `KTHREAD_STATE` and `KWAIT_REASON`.
+/// Together they are how the kernel reports a thread that `NtSuspendProcess` has parked.
+const THREAD_STATE_WAITING: u32 = 5;
+const WAIT_REASON_SUSPENDED: u32 = 5;
+/// `STATUS_INFO_LENGTH_MISMATCH`, returned when the buffer was too small.
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32.cast_signed();
+
+// The pointer arithmetic below walks the kernel's variable-length process list, so the fixed part
+// of each entry must be exactly the size and shape the kernel uses. The crate generates these from
+// the SDK headers; asserting them turns a silent misread into a build failure if that ever changes.
+const _: () = assert!(size_of::<SYSTEM_PROCESS_INFORMATION>() == 256);
+const _: () = assert!(size_of::<SYSTEM_THREAD_INFORMATION>() == 80);
+const _: () = assert!(std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, NumberOfThreads) == 4);
+const _: () = assert!(std::mem::offset_of!(SYSTEM_PROCESS_INFORMATION, UniqueProcessId) == 80);
+const _: () = assert!(std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, ThreadState) == 68);
+const _: () = assert!(std::mem::offset_of!(SYSTEM_THREAD_INFORMATION, WaitReason) == 72);
+
+/// Per-process facts that come from one `NtQuerySystemInformation` call: thread counts and which
+/// processes are fully suspended. `None` when the query fails, so the caller can fall back.
+struct SystemProcessInfo {
+    thread_counts: HashMap<u32, u32>,
+    suspended: HashSet<u32>,
+}
+
+/// One system-wide query for thread counts and suspension, instead of a toolhelp snapshot plus a
+/// handle per process. A process counts as suspended only when *every* thread is parked, which is
+/// the state `NtSuspendProcess` produces; a process with one runnable thread is not suspended.
+fn system_process_info() -> Option<SystemProcessInfo> {
+    let mut capacity = 256 * 1024_u32;
+    let mut buffer: Vec<u8> = Vec::new();
+    // Bounded retries: the list can grow between the sizing call and the real one, but a
+    // persistently growing machine must not spin here.
+    for _ in 0..4 {
+        buffer.resize(usize::try_from(capacity).unwrap_or(0), 0);
+        let mut needed = 0_u32;
+        // SAFETY: `buffer` is a live allocation of at least `capacity` bytes and `needed` is a
+        // valid out pointer; the kernel writes only within the declared length.
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                capacity,
+                &raw mut needed,
+            )
+        };
+        if status.0 == STATUS_INFO_LENGTH_MISMATCH {
+            capacity = needed
+                .max(capacity.saturating_mul(2))
+                .saturating_add(64 * 1024);
+            continue;
+        }
+        if status.0 < 0 {
+            return None;
+        }
+        return Some(parse_system_process_info(&buffer));
+    }
+    None
+}
+
+fn parse_system_process_info(buffer: &[u8]) -> SystemProcessInfo {
+    let entry_size = size_of::<SYSTEM_PROCESS_INFORMATION>();
+    let thread_size = size_of::<SYSTEM_THREAD_INFORMATION>();
+    let mut thread_counts = HashMap::new();
+    let mut suspended = HashSet::new();
+    let mut offset = 0_usize;
+    while offset + entry_size <= buffer.len() {
+        // SAFETY: `offset + entry_size <= buffer.len()` was just checked, and the read is unaligned
+        // because only the first entry is guaranteed to be aligned.
+        let entry = unsafe {
+            std::ptr::read_unaligned(
+                buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<SYSTEM_PROCESS_INFORMATION>(),
+            )
+        };
+        // The pid lives in the handle-sized `UniqueProcessId` field. A value too large for a u32
+        // cannot be a process we track, so skip the entry rather than truncating it.
+        let pid = u32::try_from(entry.UniqueProcessId.0 as usize).ok();
+        let thread_count = entry.NumberOfThreads;
+        if let Some(pid) = pid.filter(|pid| *pid != 0) {
+            thread_counts.insert(pid, thread_count);
+            let threads_start = offset + entry_size;
+            let mut all_parked = thread_count > 0;
+            for index in 0..usize::try_from(thread_count).unwrap_or(0) {
+                let start = threads_start + index * thread_size;
+                if start + thread_size > buffer.len() {
+                    all_parked = false;
+                    break;
+                }
+                // SAFETY: bounds checked immediately above, same unaligned-read reasoning.
+                let thread = unsafe {
+                    std::ptr::read_unaligned(
+                        buffer
+                            .as_ptr()
+                            .add(start)
+                            .cast::<SYSTEM_THREAD_INFORMATION>(),
+                    )
+                };
+                if thread.ThreadState != THREAD_STATE_WAITING
+                    || thread.WaitReason != WAIT_REASON_SUSPENDED
+                {
+                    all_parked = false;
+                    break;
+                }
+            }
+            if all_parked {
+                suspended.insert(pid);
+            }
+        }
+        if entry.NextEntryOffset == 0 {
+            break;
+        }
+        offset += entry.NextEntryOffset as usize;
+    }
+    SystemProcessInfo {
+        thread_counts,
+        suspended,
+    }
 }
 
 /// True when the user is presenting, gaming full screen, or otherwise should not be interrupted.
@@ -1218,8 +1350,14 @@ impl JournalLease {
 }
 
 pub fn acquire_application_lease(timeout: Duration) -> io::Result<ApplicationLease> {
-    acquire_file_lease(&application_lease_path(), timeout)
-        .map(|file| ApplicationLease { _file: file })
+    acquire_application_lease_at(&application_lease_path(), timeout)
+}
+
+/// The lease itself, against an explicit path. Split out so a test can use a private file instead of
+/// the real per-user one: the real path is held for as long as the app (or its watchdog) is running,
+/// so a test that touched it would fail whenever the app happened to be open on the same machine.
+fn acquire_application_lease_at(path: &Path, timeout: Duration) -> io::Result<ApplicationLease> {
+    acquire_file_lease(path, timeout).map(|file| ApplicationLease { _file: file })
 }
 
 fn acquire_file_lease(path: &Path, timeout: Duration) -> io::Result<fs::File> {
@@ -2075,6 +2213,76 @@ mod tests {
         }
     }
 
+    /// The explorer marks a row "已暂停" from `os_suspended`, so it has to actually reflect a
+    /// process this program suspended rather than the constant it used to be.
+    #[test]
+    fn a_suspended_process_is_reported_as_suspended() {
+        let mut child = spawn_sleeping_pwsh(30);
+        let pid = child.id();
+        let mut sampler = ProcessSampler::new();
+        let suspended_of = |sampler: &mut ProcessSampler| {
+            sampler
+                .sample()
+                .into_iter()
+                .find(|sample| sample.identity.pid == pid)
+                .map(|sample| sample.os_suspended)
+        };
+
+        // A running process is not suspended, and its thread count is populated from the query.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let sample = sampler
+                .sample()
+                .into_iter()
+                .find(|sample| sample.identity.pid == pid);
+            match sample {
+                Some(sample) if sample.thread_count > 0 => {
+                    assert!(!sample.os_suspended, "a running process is not suspended");
+                    break;
+                }
+                _ => assert!(
+                    Instant::now() < deadline,
+                    "the test child never reported a thread count"
+                ),
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let handle = unsafe {
+            OpenProcess(PROCESS_SUSPEND_RESUME, false, pid).expect("open the test child")
+        };
+        let handle = OwnedHandle(handle);
+        assert!(unsafe { NtSuspendProcess(handle.0) } >= 0, "suspend failed");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if suspended_of(&mut sampler) == Some(true) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a suspended process was never reported as suspended"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(unsafe { NtResumeProcess(handle.0) } >= 0, "resume failed");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if suspended_of(&mut sampler) == Some(false) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a resumed process stayed reported as suspended"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// A journal path that removes itself, and the `.lock` file `acquire_file_lease` creates
     /// alongside it, when the test ends. Without this every run leaves stray files in TEMP.
     struct TestJournal(PathBuf);
@@ -2328,10 +2536,12 @@ mod tests {
 
     #[test]
     fn application_lease_is_shared_across_journal_paths() {
-        let first = acquire_application_lease(Duration::from_millis(20)).unwrap();
-        assert!(acquire_application_lease(Duration::from_millis(20)).is_err());
+        // A private path, because the real application lease is held whenever the app is running.
+        let path = test_journal("application-lease").with_extension("state.json");
+        let first = acquire_application_lease_at(&path, Duration::from_millis(20)).unwrap();
+        assert!(acquire_application_lease_at(&path, Duration::from_millis(20)).is_err());
         drop(first);
-        assert!(acquire_application_lease(Duration::from_millis(20)).is_ok());
+        assert!(acquire_application_lease_at(&path, Duration::from_millis(20)).is_ok());
     }
 
     #[test]

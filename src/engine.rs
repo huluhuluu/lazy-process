@@ -1034,7 +1034,26 @@ fn matches_rule(
         || matcher.command_regex.is_some()
 }
 
+/// Case-insensitive substring test.
+///
+/// This runs for every matcher against every process on every tick, so the common all-ASCII case
+/// (command lines and most paths) uses a sliding comparison that allocates nothing. `to_lowercase`
+/// would build two fresh `String`s per call, which adds up over a few hundred processes. The
+/// Unicode-correct path is kept as a fallback so behaviour is unchanged for non-ASCII input.
 fn contains_case_insensitive(value: &str, fragment: &str) -> bool {
+    if fragment.is_empty() {
+        return true;
+    }
+    let fragment_bytes = fragment.as_bytes();
+    let value_bytes = value.as_bytes();
+    if value.is_ascii() && fragment.is_ascii() {
+        if fragment_bytes.len() > value_bytes.len() {
+            return false;
+        }
+        return value_bytes
+            .windows(fragment_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(fragment_bytes));
+    }
     value.to_lowercase().contains(&fragment.to_lowercase())
 }
 
@@ -1054,6 +1073,24 @@ mod tests {
         suspends: usize,
         restores: usize,
         trims: usize,
+    }
+
+    #[test]
+    fn case_insensitive_contains_matches_the_allocating_version() {
+        // The ASCII fast path and the Unicode fallback must agree on every case a matcher sees.
+        assert!(contains_case_insensitive("C:\\App\\Code.exe", "code.exe"));
+        assert!(contains_case_insensitive("--SERVE", "--serve"));
+        assert!(!contains_case_insensitive("code", "code.exe"));
+        assert!(!contains_case_insensitive("", "code"));
+        // An empty fragment is contained in everything, including an empty value.
+        assert!(contains_case_insensitive("anything", ""));
+        assert!(contains_case_insensitive("", ""));
+        // Non-ASCII input falls back to `to_lowercase`, which folds these the same way.
+        assert!(contains_case_insensitive("记事本", "记事本"));
+        assert!(contains_case_insensitive("ÄPFEL", "äpfel"));
+        assert!(!contains_case_insensitive("记事本", "浏览器"));
+        // A multi-byte fragment must not be matched by slicing through it.
+        assert!(!contains_case_insensitive("abc", "记事"));
     }
 
     impl ResourceController for FakeController {
@@ -1735,6 +1772,71 @@ mod tests {
         assert!(
             statuses.is_empty(),
             "a rule outside its window should not report a group"
+        );
+        assert_eq!(
+            engine.controller.restores, 1,
+            "leaving the window must restore what the rule was managing"
+        );
+    }
+
+    /// End-to-end counterpart of the `RuleSchedule` wrap test: the engine must keep a Monday-night
+    /// rule active in the small hours of Tuesday, not just in the `contains` unit test.
+    #[test]
+    fn a_rule_restricted_to_monday_night_still_applies_on_tuesday_morning() {
+        let mut config = test_config(false);
+        config.rules[0].schedule = Some(RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            // Monday only: bit 1, since bit 0 is Sunday.
+            days: 0b0000_0010,
+        });
+        let samples = vec![process(10, None, "codex.exe", 0.0, 100)];
+
+        // 23:00 on Monday: inside the window, so the group is throttled.
+        let mut engine = Engine::new(FakeController::default());
+        let monday_evening = TickContext {
+            now_seconds: 0,
+            minute_of_day: 23 * 60,
+            weekday: 1,
+            ..Default::default()
+        };
+        engine.tick_with(&config, &samples, &HashSet::new(), monday_evening);
+        let tuesday = TickContext {
+            now_seconds: 6,
+            minute_of_day: 2 * 60,
+            weekday: 2,
+            ..Default::default()
+        };
+        let statuses = engine.tick_with(&config, &samples, &HashSet::new(), tuesday);
+        assert_eq!(
+            statuses[0].state,
+            ActivityState::Throttled,
+            "Tuesday 02:00 is still Monday night"
+        );
+        assert_eq!(engine.controller.restores, 0);
+
+        // 23:00 on Tuesday is a different night and must not be covered. Throttle first, while
+        // still inside Monday night, so there is something for leaving the window to restore.
+        let mut engine = Engine::new(FakeController::default());
+        engine.tick_with(&config, &samples, &HashSet::new(), monday_evening);
+        let later_monday = TickContext {
+            now_seconds: 6,
+            minute_of_day: 23 * 60 + 30,
+            weekday: 1,
+            ..Default::default()
+        };
+        let statuses = engine.tick_with(&config, &samples, &HashSet::new(), later_monday);
+        assert_eq!(statuses[0].state, ActivityState::Throttled);
+        let tuesday_evening = TickContext {
+            now_seconds: 12,
+            minute_of_day: 23 * 60,
+            weekday: 2,
+            ..Default::default()
+        };
+        let statuses = engine.tick_with(&config, &samples, &HashSet::new(), tuesday_evening);
+        assert!(
+            statuses.is_empty(),
+            "Tuesday evening is not part of Monday night"
         );
         assert_eq!(
             engine.controller.restores, 1,

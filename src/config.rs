@@ -48,19 +48,42 @@ impl RuleSchedule {
     /// Whether the window is open at `minute_of_day` on `weekday` (0 = Sunday).
     #[must_use]
     pub fn contains(&self, minute_of_day: u16, weekday: u8) -> bool {
-        if self.days != 0 && weekday < 7 && self.days & (1 << weekday) == 0 {
-            return false;
-        }
         // An empty window covers the whole day rather than nothing, so a half-filled schedule
         // cannot silently disable a rule.
         if self.start_minute == self.end_minute {
-            return true;
+            return self.day_is_enabled(weekday);
         }
         if self.start_minute < self.end_minute {
-            (self.start_minute..self.end_minute).contains(&minute_of_day)
-        } else {
-            minute_of_day >= self.start_minute || minute_of_day < self.end_minute
+            return self.day_is_enabled(weekday)
+                && (self.start_minute..self.end_minute).contains(&minute_of_day);
         }
+        // The window wraps midnight. The part at or after `start_minute` is the evening that
+        // belongs to this day; the part before `end_minute` is the tail of the *previous* day's
+        // window. Testing the current weekday for both would cut a night in half at midnight, so a
+        // rule set to "Monday, 22:00-06:00" would never reach 06:00 on Tuesday.
+        if minute_of_day >= self.start_minute {
+            return self.day_is_enabled(weekday);
+        }
+        if minute_of_day < self.end_minute {
+            let previous = match weekday {
+                0 => 6,
+                day if day < 7 => day - 1,
+                // A weekday outside the seven the OS reports is allowed rather than denied.
+                _ => return true,
+            };
+            return self.day_is_enabled(previous);
+        }
+        false
+    }
+
+    /// Whether the day mask allows `weekday`. A zero mask means every day, and a weekday outside
+    /// the seven the OS reports is allowed rather than denied. Takes `self` by value because the
+    /// struct is smaller than a pointer.
+    fn day_is_enabled(self, weekday: u8) -> bool {
+        if self.days == 0 || weekday >= 7 {
+            return true;
+        }
+        self.days & (1 << weekday) != 0
     }
 }
 
@@ -269,8 +292,25 @@ impl AppConfig {
             ));
         }
         config.schema_version = SCHEMA_VERSION;
+        // Repair values that are out of range before validating, so a hand-edited file with one bad
+        // bit is fixed rather than rejected. Rejecting it would drop into the degraded "config failed
+        // to load" mode, where the next settings change writes a default over the user's file.
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Clamps values that a hand-edited file can push out of range. Only fields where a sensible
+    /// repair exists are touched; everything else is left for [`Self::validate`] to reject.
+    fn normalize(&mut self) {
+        for rule in &mut self.rules {
+            if let Some(schedule) = &mut rule.schedule {
+                // Only bits 0-6 name a day. Clearing the rest keeps the days the user did pick; a
+                // mask that was entirely out of range becomes zero, which means "every day" rather
+                // than a rule that can never run.
+                schedule.days &= 0b0111_1111;
+            }
+        }
     }
 
     pub fn validate(&self) -> io::Result<()> {
@@ -311,6 +351,17 @@ impl AppConfig {
             {
                 return Err(invalid_config(format!(
                     "规则 {} 的时段必须在一天之内",
+                    rule.id
+                )));
+            }
+            // Only bits 0-6 name a day. A bit outside that range is non-zero, so `contains` would
+            // treat the schedule as a real restriction that no weekday can ever satisfy, silently
+            // disabling the rule instead of failing loudly.
+            if let Some(schedule) = &rule.schedule
+                && schedule.days & !0b0111_1111 != 0
+            {
+                return Err(invalid_config(format!(
+                    "规则 {} 的生效日包含无效的星期",
                     rule.id
                 )));
             }
@@ -562,6 +613,50 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// A hand-edited file with a day bit outside the week must be repaired on load rather than
+    /// rejected: rejecting it drops the whole configuration into the degraded mode where the next
+    /// settings change writes a default over the user's file, losing every other rule. The days the
+    /// user did pick have to survive the repair.
+    #[test]
+    fn an_out_of_range_day_mask_is_repaired_on_load_not_rejected() {
+        let path = test_config_path("days-repair");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut config = AppConfig::default();
+        config.rules[0].schedule = Some(RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            // Monday plus the invalid bit 7.
+            days: 0b1000_0010,
+        });
+        // `save_atomic` validates, so write the JSON directly, as a hand edit would.
+        let mut raw = serde_json::to_value(&config).unwrap();
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).expect("the file must load after repair");
+        assert_eq!(
+            loaded.rules[0].schedule.unwrap().days,
+            0b0000_0010,
+            "the valid Monday bit must survive while bit 7 is cleared"
+        );
+
+        // A mask that was entirely out of range becomes zero, which means every day rather than a
+        // rule that can never run.
+        raw["rules"][0]["schedule"]["days"] = serde_json::json!(0b1000_0000);
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded.rules[0].schedule.unwrap().days, 0);
+
+        // Saving is still strict, so the invalid value cannot be written back out.
+        let mut strict = AppConfig::default();
+        strict.rules[0].schedule = Some(RuleSchedule {
+            start_minute: 0,
+            end_minute: 0,
+            days: 0b1000_0000,
+        });
+        assert!(strict.save_atomic(&path).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn invalid_and_future_configs_are_rejected_without_overwrite() {
         let path = test_config_path("invalid");
@@ -649,6 +744,33 @@ mod tests {
         assert_eq!(config.restore_missing_presets(), 0);
     }
 
+    /// A window that wraps midnight is documented as covering "the night", so a rule restricted to
+    /// Monday and set to 22:00-06:00 should cover Monday evening *and* the small hours of Tuesday.
+    /// Checking the day mask against the current weekday alone cuts that night in half at midnight.
+    #[test]
+    fn a_wrapping_window_keeps_its_day_across_midnight() {
+        // Monday only, 22:00-06:00. Bit 1 is Monday (bit 0 is Sunday).
+        let monday_night = RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            days: 0b0000_0010,
+        };
+        // Monday evening is inside.
+        assert!(monday_night.contains(23 * 60, 1));
+        // The small hours of Tuesday still belong to Monday night.
+        assert!(
+            monday_night.contains(2 * 60, 2),
+            "the night must survive the midnight boundary"
+        );
+        assert!(monday_night.contains(5 * 60 + 59, 2));
+        // But Tuesday evening is not part of Monday night.
+        assert!(!monday_night.contains(23 * 60, 2));
+        // Sunday night is not Monday night either.
+        assert!(!monday_night.contains(2 * 60, 1));
+        // The exclusive end is still excluded, now on the following day.
+        assert!(!monday_night.contains(6 * 60, 2));
+    }
+
     #[test]
     fn a_schedule_outside_a_day_is_rejected() {
         let mut config = AppConfig::default();
@@ -665,6 +787,102 @@ mod tests {
             days: 0,
         });
         assert!(config.validate().is_ok());
+    }
+
+    /// The `days` mask has seven meaningful bits, one per day. A value with a bit outside that
+    /// range is non-zero, so `contains` treats it as a real restriction, yet it can never match a
+    /// weekday the OS reports (0-6). The rule would then be silently dead, which is exactly what the
+    /// "a half-filled schedule cannot silently disable a rule" promise rules out.
+    #[test]
+    fn a_day_mask_with_a_bit_outside_the_week_is_rejected() {
+        let mut config = AppConfig::default();
+        config.rules[0].schedule = Some(RuleSchedule {
+            start_minute: 0,
+            end_minute: 0,
+            days: 0b1000_0000,
+        });
+        assert!(
+            config.validate().is_err(),
+            "a day mask with no valid day must not validate"
+        );
+
+        // Every in-range mask is still accepted, including all seven days.
+        for days in [0b0000_0001_u8, 0b0111_1111, 0b0011_1110] {
+            config.rules[0].schedule = Some(RuleSchedule {
+                start_minute: 0,
+                end_minute: 0,
+                days,
+            });
+            assert!(config.validate().is_ok(), "days {days:#010b} must validate");
+        }
+    }
+
+    /// The wrap fix must not change what a window that does *not* wrap does, and the "every day"
+    /// mask must still cover every day. These are the cases the fix could plausibly have broken.
+    #[test]
+    fn day_masks_keep_their_meaning_in_both_directions() {
+        // Monday only, a plain 09:00-17:00 window.
+        let monday_day = RuleSchedule {
+            start_minute: 9 * 60,
+            end_minute: 17 * 60,
+            days: 0b0000_0010,
+        };
+        assert!(monday_day.contains(9 * 60, 1));
+        assert!(monday_day.contains(16 * 60 + 59, 1));
+        assert!(!monday_day.contains(17 * 60, 1));
+        assert!(!monday_day.contains(8 * 60 + 59, 1));
+        // A non-wrapping window must not bleed into the next day.
+        assert!(!monday_day.contains(9 * 60, 2));
+        assert!(!monday_day.contains(2 * 60, 2));
+
+        // The same wrap window with "every day" covers every hour of every day.
+        let nightly = RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            days: 0,
+        };
+        for weekday in 0..7 {
+            assert!(nightly.contains(23 * 60, weekday));
+            assert!(nightly.contains(2 * 60, weekday));
+            assert!(!nightly.contains(12 * 60, weekday));
+        }
+
+        // Saturday night rolling into Sunday: bit 6 is Saturday, bit 0 is Sunday.
+        let saturday_night = RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            days: 0b0100_0000,
+        };
+        assert!(saturday_night.contains(23 * 60, 6));
+        assert!(
+            saturday_night.contains(60, 0),
+            "Saturday night ends Sunday morning"
+        );
+        assert!(!saturday_night.contains(60, 1));
+
+        // Sunday night rolls back to the start of the week.
+        let sunday_night = RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            days: 0b0000_0001,
+        };
+        assert!(sunday_night.contains(23 * 60, 0));
+        assert!(
+            sunday_night.contains(3 * 60, 1),
+            "Sunday night ends Monday morning"
+        );
+
+        // An out-of-range weekday is allowed rather than denied, in both window shapes.
+        assert!(monday_day.contains(12 * 60, 99));
+        assert!(monday_night_of(0b0000_0010).contains(2 * 60, 99));
+    }
+
+    fn monday_night_of(days: u8) -> RuleSchedule {
+        RuleSchedule {
+            start_minute: 22 * 60,
+            end_minute: 6 * 60,
+            days,
+        }
     }
 
     #[test]

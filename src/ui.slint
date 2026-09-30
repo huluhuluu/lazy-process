@@ -45,6 +45,9 @@ export struct StatusRow {
     state-color: color,
     memory: string,
     cpu: string,
+    // The root process. Used to key the selection so a reordered list cannot highlight the wrong
+    // card, the same reason the process rows carry their pid.
+    pid: int,
     // Empty when nothing is pending, e.g. a group that is already suspended.
     countdown: string,
     // Whether "恢复" and "本次排除" can act on this group.
@@ -54,8 +57,10 @@ export struct StatusRow {
 export struct AppRow {
     name: string,
     path: string,
+    // Identity for the selection and for "add rule". A row index would drift: the candidate list is
+    // rebuilt and re-sorted on every sample, so an index recorded before a refresh can point at a
+    // different application by the time the user clicks.
     pid: int,
-    source-index: int,
 }
 
 export struct EventRow {
@@ -85,8 +90,6 @@ export struct ProcessRow {
     // Managed by one of our rules. Marks the rows where ending a process would fight a rule.
     managed: bool,
     suspended: bool,
-    // Index into the unfiltered sample, so a click keeps working while the list is filtered.
-    source-index: int,
 }
 
 // A member of a managed group, shown when its status card is expanded.
@@ -114,6 +117,11 @@ component NavItem inherits Rectangle {
     height: 38px;
     border-radius: 6px;
     background: current == index ? Theme.surface-selected : area.has-hover ? Theme.surface-hover : transparent;
+    // The label is drawn by hand, so the role and name have to be stated for screen readers.
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-item-selectable: true;
+    accessible-item-selected: current == index;
     area := TouchArea { clicked => { root.selected(index); } }
     Text {
         x: 13px;
@@ -132,6 +140,10 @@ component StateBadge inherits Rectangle {
     height: 24px;
     border-radius: 6px;
     background: badge-color;
+    // Qualified because this component has its own `text` property, which would otherwise shadow
+    // the enum value of the same name.
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
     // Fixed rather than themed: the background comes from Rust as a mid-tone state colour in both
     // palettes, so light text is the readable choice either way.
     Text { text: root.text; horizontal-alignment: center; vertical-alignment: center; color: #f4f7f5; font-size: 11px; font-weight: 600; }
@@ -184,6 +196,10 @@ component MetricBar inherits VerticalLayout {
     in property <float> fraction;
     in property <color> bar-color;
     spacing: 5px;
+    // The bar is drawn from `fraction`, so expose the reading itself rather than the shapes.
+    accessible-role: progress-indicator;
+    accessible-label: root.label;
+    accessible-value: root.value;
     HorizontalLayout {
         Text { text: root.label; color: Theme.ink-soft; font-size: 10px; }
         Rectangle { horizontal-stretch: 1; }
@@ -215,6 +231,11 @@ component ColumnHeader inherits Rectangle {
     height: 26px;
     background: area.has-hover ? Theme.surface-hover : transparent;
     border-radius: 4px;
+    // Reads as "名称，已按升序排序" rather than an unlabelled glyph run.
+    accessible-role: button;
+    accessible-label: root.active == root.column
+        ? root.label + (root.descending ? "，已按降序排序" : "，已按升序排序")
+        : root.label;
     area := TouchArea { clicked => { root.picked(root.column); } }
     Text {
         x: 6px;
@@ -248,15 +269,25 @@ component SettingRow inherits HorizontalLayout {
 export component ControlPanel inherits Window {
     title: "Lazy Process";
     icon: @image-url("tray-icon.svg");
-    width: 980px;
-    height: 680px;
+    // `preferred-*` is the size the window opens at; `min-*` keeps the layout usable when it is
+    // resized. Without the minimums the sidebar and the process columns would be squeezed into
+    // unreadable slivers on a small or high-DPI display.
+    preferred-width: 980px;
+    preferred-height: 680px;
+    min-width: 760px;
+    min-height: 520px;
     background: Theme.canvas;
 
     in-out property <int> page: 0;
+    // The rule list is rebuilt only from the configuration on this thread, and rule edits happen
+    // here too, so a row index stays valid between the list being drawn and a button being clicked.
     in-out property <int> selected-rule: -1;
-    in-out property <int> selected-app: -1;
-    in-out property <int> selected-app-source: -1;
-    in-out property <int> selected-status: -1;
+    // Selections are keyed on a stable identity rather than a row index, because the lists behind
+    // them are rebuilt on every sample and an index can silently start naming a different row.
+    // -1 means nothing is selected.
+    in-out property <int> selected-app-pid: -1;
+    in-out property <int> selected-status-pid: -1;
+    in-out property <int> expanded-status-pid: -1;
     in-out property <string> app-filter: "";
     in property <bool> globally-enabled: true;
     in property <bool> start-with-windows: false;
@@ -295,12 +326,11 @@ export component ControlPanel inherits Window {
     in property <float> system-memory-fraction: 0.0;
     in property <string> system-summary: "";
     in-out property <int> selected-process: -1;
-    in-out property <int> selected-process-source: -1;
+    in-out property <int> selected-process-pid: -1;
     in property <string> kill-target: "";
     in property <string> kill-warning: "";
     in property <string> explorer-error: "";
 
-    in-out property <int> expanded-status: -1;
     in property <[MemberRow]> status-members;
     in property <[PreviewRow]> draft-preview;
     in property <int> draft-preview-total: 0;
@@ -397,12 +427,19 @@ export component ControlPanel inherits Window {
                         }
                     }
                 }
-                NavItem { label: "概览"; index: 0; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "进程"; index: 1; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "应用规则"; index: 2; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "添加应用"; index: 3; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "事件日志"; index: 4; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
-                NavItem { label: "设置"; index: 5; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                // Grouped so a screen reader announces the sidebar as a tab list and can move
+                // between the pages with the usual tab-list navigation.
+                VerticalLayout {
+                    accessible-role: tab-list;
+                    accessible-label: "页面导航";
+                    spacing: 6px;
+                    NavItem { label: "概览"; index: 0; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                    NavItem { label: "进程"; index: 1; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                    NavItem { label: "应用规则"; index: 2; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                    NavItem { label: "添加应用"; index: 3; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                    NavItem { label: "事件日志"; index: 4; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                    NavItem { label: "设置"; index: 5; current: root.page; selected(i) => { root.page = i; root.page-selected(i); } }
+                }
                 Rectangle { vertical-stretch: 1; }
                 if root.user-busy : Rectangle {
                     height: 44px;
@@ -503,16 +540,20 @@ export component ControlPanel inherits Window {
                     if root.statuses.length > 0 : ScrollView {
                         VerticalLayout {
                             spacing: 7px;
-                            for status[i] in root.statuses : Rectangle {
+                            for status in root.statuses : Rectangle {
                                 // Grows to fit the member list once the card is expanded. The
                                 // members model only ever holds the expanded group's rows.
-                                height: root.expanded-status == i
+                                height: root.expanded-status-pid == status.pid
                                     ? 104px + root.status-members.length * 22px
                                     : 72px;
                                 background: Theme.surface;
-                                border-width: root.selected-status == i ? 2px : 1px;
-                                border-color: root.selected-status == i ? Theme.accent-strong : Theme.border;
+                                border-width: root.selected-status-pid == status.pid ? 2px : 1px;
+                                border-color: root.selected-status-pid == status.pid ? Theme.accent-strong : Theme.border;
                                 border-radius: 7px;
+                                accessible-role: groupbox;
+                                accessible-label: status.title + "，" + status.state + "，" + status.process-count + " 个进程";
+                                accessible-expandable: true;
+                                accessible-expanded: root.expanded-status-pid == status.pid;
                                 VerticalLayout {
                                     padding: 12px;
                                     spacing: 8px;
@@ -520,8 +561,8 @@ export component ControlPanel inherits Window {
                                         height: 44px;
                                         TouchArea {
                                             clicked => {
-                                                root.selected-status = i;
-                                                root.toggle-status(i);
+                                                root.selected-status-pid = status.pid;
+                                                root.toggle-status(status.pid);
                                             }
                                         }
                                         HorizontalLayout {
@@ -532,7 +573,7 @@ export component ControlPanel inherits Window {
                                                 HorizontalLayout {
                                                     spacing: 6px;
                                                     Text {
-                                                        text: root.expanded-status == i ? "▾" : "▸";
+                                                        text: root.expanded-status-pid == status.pid ? "▾" : "▸";
                                                         color: Theme.ink-faint;
                                                         font-size: 11px;
                                                         vertical-alignment: center;
@@ -563,11 +604,11 @@ export component ControlPanel inherits Window {
                                             StateBadge { text: status.state; badge-color: status.state-color; }
                                         }
                                     }
-                                    if root.expanded-status == i : Rectangle {
+                                    if root.expanded-status-pid == status.pid : Rectangle {
                                         height: 1px;
                                         background: Theme.border-soft;
                                     }
-                                    if root.expanded-status == i : VerticalLayout {
+                                    if root.expanded-status-pid == status.pid : VerticalLayout {
                                         spacing: 2px;
                                         for member in root.status-members : HorizontalLayout {
                                             height: 20px;
@@ -587,12 +628,12 @@ export component ControlPanel inherits Window {
                                             Button {
                                                 text: "本次排除";
                                                 enabled: status.managed;
-                                                clicked => { root.exclude-group(i); }
+                                                clicked => { root.exclude-group(status.pid); }
                                             }
                                             Button {
                                                 text: "立即恢复";
                                                 enabled: status.managed;
-                                                clicked => { root.restore-group(i); }
+                                                clicked => { root.restore-group(status.pid); }
                                             }
                                         }
                                     }
@@ -671,13 +712,13 @@ export component ControlPanel inherits Window {
                         }
                         Button {
                             text: "加为规则";
-                            enabled: root.selected-process-source >= 0;
-                            clicked => { root.add-process-rule(root.selected-process-source); }
+                            enabled: root.selected-process-pid >= 0;
+                            clicked => { root.add-process-rule(root.selected-process-pid); }
                         }
                         Button {
                             text: "结束进程";
-                            enabled: root.selected-process-source >= 0;
-                            clicked => { root.ask-kill(root.selected-process-source); }
+                            enabled: root.selected-process-pid >= 0;
+                            clicked => { root.ask-kill(root.selected-process-pid); }
                         }
                     }
                     if root.processes.length == 0 : EmptyState {
@@ -713,15 +754,20 @@ export component ControlPanel inherits Window {
                                         ? Theme.surface-selected
                                         : row-area.has-hover ? Theme.surface-hover : transparent;
                                     border-radius: 4px;
+                                    accessible-role: list-item;
+                                    accessible-label: row.name + "，PID " + row.pid + "，CPU " + row.cpu + "，内存 " + row.memory + "，" + row.status;
+                                    accessible-item-index: i;
+                                    accessible-item-count: root.processes.length;
+                                    accessible-item-selected: root.selected-process == i;
                                     row-area := TouchArea {
                                         clicked => {
                                             root.selected-process = i;
-                                            root.selected-process-source = row.source-index;
+                                            root.selected-process-pid = row.pid;
                                         }
                                         double-clicked => {
                                             root.selected-process = i;
-                                            root.selected-process-source = row.source-index;
-                                            root.ask-kill(row.source-index);
+                                            root.selected-process-pid = row.pid;
+                                            root.ask-kill(row.pid);
                                         }
                                     }
                                     HorizontalLayout {
@@ -794,6 +840,11 @@ export component ControlPanel inherits Window {
                                 border-width: root.selected-rule == i ? 2px : 1px;
                                 border-color: root.selected-rule == i ? Theme.accent-strong : Theme.border;
                                 border-radius: 7px;
+                                accessible-role: list-item;
+                                accessible-label: rule.name + "，" + rule.matcher;
+                                accessible-item-index: i;
+                                accessible-item-count: root.rules.length;
+                                accessible-item-selected: root.selected-rule == i;
                                 TouchArea { clicked => { root.selected-rule = i; } }
                                 VerticalLayout {
                                     padding: 12px;
@@ -871,15 +922,14 @@ export component ControlPanel inherits Window {
                         VerticalLayout {
                             padding: 12px;
                             app-list := ListView {
-                                for app[i] in root.apps : Rectangle {
+                                for app in root.apps : Rectangle {
                                     width: app-list.width;
                                     height: 56px;
-                                    background: root.selected-app == i ? Theme.surface-selected : app-row-area.has-hover ? Theme.surface-hover : Theme.surface;
+                                    background: root.selected-app-pid == app.pid ? Theme.surface-selected : app-row-area.has-hover ? Theme.surface-hover : Theme.surface;
 
                                     app-row-area := TouchArea {
                                         clicked => {
-                                            root.selected-app = i;
-                                            root.selected-app-source = app.source-index;
+                                            root.selected-app-pid = app.pid;
                                         }
                                     }
 
@@ -889,10 +939,9 @@ export component ControlPanel inherits Window {
                                         spacing: 10px;
                                         CheckBox {
                                             text: "";
-                                            checked: root.selected-app == i;
+                                            checked: root.selected-app-pid == app.pid;
                                             toggled => {
-                                                root.selected-app = self.checked ? i : -1;
-                                                root.selected-app-source = self.checked ? app.source-index : -1;
+                                                root.selected-app-pid = self.checked ? app.pid : -1;
                                             }
                                         }
                                         VerticalLayout {
@@ -916,7 +965,7 @@ export component ControlPanel inherits Window {
                                 height: 36px;
                                 vertical-stretch: 0;
                                 Rectangle { horizontal-stretch: 1; }
-                                Button { text: "添加应用规则"; enabled: root.selected-app-source >= 0; clicked => { root.add-app(root.selected-app-source); } }
+                                Button { text: "添加应用规则"; enabled: root.selected-app-pid >= 0; clicked => { root.add-app(root.selected-app-pid); } }
                             }
                         }
                     }
@@ -1096,10 +1145,13 @@ export component ControlPanel inherits Window {
         // Enter saves and Escape cancels, matching every other dialog on Windows. The scope wraps
         // the dialog so keys a focused field does not consume still reach it.
         editor-keys := FocusScope {
-            x: (parent.width - 660px) / 2;
-            y: (parent.height - 640px) / 2;
-            width: 660px;
-            height: 640px;
+            // Shrinks with the window instead of overflowing it: the form scrolls, so a smaller
+            // dialog is usable, while a window too short to hold 640px would otherwise clip the
+            // save and cancel buttons off the bottom.
+            width: min(660px, parent.width - 32px);
+            height: min(640px, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
             init => { self.focus(); }
             key-pressed(event) => {
                 if (event.text == Key.Escape) {

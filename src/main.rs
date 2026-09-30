@@ -27,7 +27,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
     thread,
@@ -36,8 +36,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE,
-            WAIT_OBJECT_0,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError,
+            HANDLE, LPARAM, SetLastError, WAIT_OBJECT_0, WPARAM,
         },
         System::{
             Registry::{
@@ -46,7 +46,10 @@ use windows::{
                 RegGetValueW, RegSetValueExW,
             },
             SystemInformation::GetLocalTime,
-            Threading::{CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject},
+            Threading::{
+                CreateEventW, CreateMutexW, GetCurrentThreadId, OpenEventW, SetEvent,
+                WaitForSingleObject,
+            },
         },
         UI::{
             Controls::Dialogs::{
@@ -57,7 +60,7 @@ use windows::{
                 MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
                 VK_F12,
             },
-            WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY},
+            WindowsAndMessaging::{GetMessageW, MSG, PostThreadMessageW, WM_HOTKEY, WM_QUIT},
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -91,6 +94,10 @@ struct RuntimeState {
     /// The process a kill confirmation is waiting on.
     kill_target: Arc<Mutex<Option<ProcessIdentity>>>,
     explorer_error: Arc<Mutex<Option<String>>>,
+    /// Set when the configuration on disk could not be loaded, so the in-memory copy is a default
+    /// standing in for a file we refused to overwrite. Saving in that state would replace the user's
+    /// rules with presets, so every write is refused until the file is fixed by hand.
+    config_read_only: Arc<AtomicBool>,
     config_path: PathBuf,
     event_log_path: PathBuf,
 }
@@ -151,6 +158,10 @@ struct NamedMutex(HANDLE);
 impl NamedMutex {
     fn acquire() -> Result<Option<Self>, String> {
         let name = HSTRING::from("Local\\LazyProcessControlPanel");
+        // CreateMutexW leaves the last error alone when it succeeds without creating a new object,
+        // so a stale ERROR_ALREADY_EXISTS from earlier in the process would otherwise be read as
+        // "another instance is running" and refuse to start.
+        unsafe { SetLastError(ERROR_SUCCESS) };
         let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
             .map_err(|error| error.to_string())?;
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -227,6 +238,9 @@ fn run() -> Result<(), String> {
         managed_pids: Arc::new(Mutex::new(HashSet::new())),
         kill_target: Arc::new(Mutex::new(None)),
         explorer_error: Arc::new(Mutex::new(None)),
+        // A failed load means the in-memory configuration is a default standing in for a file we
+        // must not overwrite, so saving stays disabled until the user fixes the file.
+        config_read_only: Arc::new(AtomicBool::new(config_error.is_some())),
         config_path,
         event_log_path: event_log,
     };
@@ -267,12 +281,15 @@ fn run() -> Result<(), String> {
         stop.clone(),
         journal,
     );
-    let _hotkey = start_hotkey(worker_tx.clone(), state.clone());
+    let (hotkey, hotkey_thread_id) = start_hotkey(worker_tx.clone(), state.clone(), stop.clone());
     start_show_panel_watcher(panel.as_weak(), stop.clone());
     slint::run_event_loop().map_err(|error| error.to_string())?;
     stop.store(true, Ordering::Release);
     let _ = worker_tx.send(WorkerCommand::Refresh);
-    join_worker_with_timeout(worker);
+    stop_hotkey(&hotkey_thread_id, hotkey);
+    if let Err(error) = join_worker_with_timeout(worker) {
+        push_event(&state, error);
+    }
     drop(tray);
     Ok(())
 }
@@ -367,12 +384,7 @@ fn install_callbacks(
         mutate_config(&runtime, |config| {
             config.globally_enabled = !config.globally_enabled;
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
-        if let Some(tray) = tray_weak.upgrade() {
-            refresh_tray(&tray, &runtime);
-        }
+        refresh_from_weak(&weak, &tray_weak, &runtime);
     });
     let stop_flag = stop.clone();
     tray.on_quit(move || {
@@ -385,12 +397,7 @@ fn install_callbacks(
     let tray_weak = tray.as_weak();
     panel.on_set_global_enabled(move |enabled| {
         mutate_config(&runtime, |config| config.globally_enabled = enabled);
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
-        if let Some(tray) = tray_weak.upgrade() {
-            refresh_tray(&tray, &runtime);
-        }
+        refresh_from_weak(&weak, &tray_weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -399,9 +406,7 @@ fn install_callbacks(
             Ok(()) => mutate_config(&runtime, |config| config.start_with_windows = enabled),
             Err(error) => push_event(&runtime, format!("开机启动设置失败：{error}")),
         }
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let tx = worker.clone();
     panel.on_restore_all(move || {
@@ -426,10 +431,12 @@ fn install_callbacks(
     let weak = panel.as_weak();
     panel.on_page_selected(move |page| {
         if let Some(panel) = weak.upgrade() {
-            if page == 2 {
-                refresh_candidate_model(&panel, &runtime);
-            } else if page == 3 {
-                refresh_event_model(&panel, &runtime);
+            // Both models are only built for the page that is actually visible, so opening one has
+            // to fill it in immediately rather than waiting for the next sample.
+            match Page::from_index(page) {
+                Page::AddApp => refresh_candidate_model(&panel, &runtime),
+                Page::Events => refresh_event_model(&panel, &runtime),
+                _ => {}
             }
         }
     });
@@ -441,10 +448,16 @@ fn install_callbacks(
 
     let runtime = state.clone();
     let weak = panel.as_weak();
-    panel.on_add_app(move |index| {
-        let candidate = usize::try_from(index)
-            .ok()
-            .and_then(|index| runtime.candidates.lock().ok()?.get(index).cloned());
+    panel.on_add_app(move |pid| {
+        // Resolved by pid rather than by row index: the candidate list is rebuilt and re-sorted on
+        // every sample, so an index recorded when the row was drawn could name another app by the
+        // time the click arrives.
+        let candidate = runtime.candidates.lock().ok().and_then(|candidates| {
+            candidates
+                .iter()
+                .find(|candidate| i32::try_from(candidate.pid).ok() == Some(pid))
+                .cloned()
+        });
         if let Some(candidate) = candidate {
             mutate_config(&runtime, |config| {
                 let id = unique_rule_id(config, &slug(&candidate.name));
@@ -459,10 +472,12 @@ fn install_callbacks(
                     ..Default::default()
                 });
             });
-            push_event(&runtime, format!("已添加 {} 的路径规则", candidate.name));
+            if !config_save_failed(&runtime) {
+                push_event(&runtime, format!("已添加 {} 的路径规则", candidate.name));
+            }
         }
         if let Some(panel) = weak.upgrade() {
-            panel.set_page(2);
+            panel.set_page(Page::Rules.index());
             refresh_panel(&panel, &runtime);
         }
     });
@@ -483,24 +498,27 @@ fn install_callbacks(
         if name.is_empty() {
             return;
         }
-        add_path_rule(&runtime, &name, &path);
-        push_event(&runtime, format!("已添加 {name} 的路径规则"));
+        if add_path_rule(&runtime, &name, &path) {
+            push_event(&runtime, format!("已添加 {name} 的路径规则"));
+        }
         if let Some(panel) = weak.upgrade() {
-            panel.set_page(2);
+            panel.set_page(Page::Rules.index());
             refresh_panel(&panel, &runtime);
         }
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
-    panel.on_add_process_rule(move |source_index| {
-        let process = usize::try_from(source_index)
-            .ok()
-            .and_then(|index| runtime.sample.lock().ok()?.get(index).cloned());
+    panel.on_add_process_rule(move |pid| {
+        // Resolved by PID rather than by row index: the sample is replaced on every tick, so an
+        // index captured when the row was drawn can point at a different process by the time the
+        // user clicks. Identity is revalidated again before anything acts on the process.
+        let process = sample_process_by_pid(&runtime, pid);
         if let Some(process) = process {
-            add_path_rule(&runtime, &process.name, &process.identity.executable_path);
-            push_event(&runtime, format!("已添加 {} 的路径规则", process.name));
+            if add_path_rule(&runtime, &process.name, &process.identity.executable_path) {
+                push_event(&runtime, format!("已添加 {} 的路径规则", process.name));
+            }
             if let Some(panel) = weak.upgrade() {
-                panel.set_page(2);
+                panel.set_page(Page::Rules.index());
                 refresh_panel(&panel, &runtime);
             }
         }
@@ -513,17 +531,13 @@ fn install_callbacks(
     let weak = panel.as_weak();
     panel.on_retry_save(move || {
         retry_config_save(&runtime);
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
     panel.on_dismiss_save_error(move || {
         clear_save_error(&runtime);
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
 }
 
@@ -532,9 +546,7 @@ fn install_rule_callbacks(panel: &ControlPanel, state: &RuntimeState) {
     let weak = panel.as_weak();
     panel.on_set_rule_enabled(move |index, enabled| {
         mutate_rule(&runtime, index, |rule| rule.enabled = enabled);
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -548,9 +560,7 @@ fn install_rule_callbacks(panel: &ControlPanel, state: &RuntimeState) {
                 "已关闭规则的二级暂停".into()
             },
         );
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -563,9 +573,7 @@ fn install_rule_callbacks(panel: &ControlPanel, state: &RuntimeState) {
                 .suspend_after_seconds
                 .max(rule.throttle_after_seconds + 60);
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -576,9 +584,7 @@ fn install_rule_callbacks(panel: &ControlPanel, state: &RuntimeState) {
             rule.suspend_after_seconds =
                 u64::try_from((minutes + i64::from(delta)).clamp(minimum, 480)).unwrap_or(20) * 60;
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -590,9 +596,7 @@ fn install_rule_callbacks(panel: &ControlPanel, state: &RuntimeState) {
                 }
             });
         }
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
 }
 
@@ -818,9 +822,7 @@ fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState) {
             config.sample_interval_seconds =
                 step_sample_interval(config.sample_interval_seconds, delta);
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -828,9 +830,7 @@ fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState) {
         mutate_config(&runtime, |config| {
             config.cpu_quiet_percent = step_cpu_threshold(config.cpu_quiet_percent, delta);
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -839,9 +839,7 @@ fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState) {
             config.io_quiet_bytes_per_sample =
                 step_io_threshold(config.io_quiet_bytes_per_sample, delta);
         });
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
-        }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -890,17 +888,18 @@ fn install_rule_library_callbacks(panel: &ControlPanel, state: &RuntimeState) {
         mutate_config(&runtime, |config| {
             restored = config.restore_missing_presets();
         });
-        push_event(
-            &runtime,
-            if restored == 0 {
-                "预设规则已齐全，未做改动".to_owned()
-            } else {
-                format!("已补回 {restored} 条预设规则")
-            },
-        );
-        if let Some(panel) = weak.upgrade() {
-            refresh_panel(&panel, &runtime);
+        // On a failed write `mutate_config` rolled the presets back and already logged why.
+        if !config_save_failed(&runtime) {
+            push_event(
+                &runtime,
+                if restored == 0 {
+                    "预设规则已齐全，未做改动".to_owned()
+                } else {
+                    format!("已补回 {restored} 条预设规则")
+                },
+            );
         }
+        refresh_panel_from_weak(&weak, &runtime);
     });
     let runtime = state.clone();
     panel.on_export_rules(move || match export_rules(&runtime) {
@@ -962,29 +961,29 @@ fn install_explorer_callbacks(
     install_kill_callbacks(panel, state, worker);
     let runtime = state.clone();
     let sender = worker.clone();
-    panel.on_restore_group(move |index| {
-        if let Some((rule_id, pid)) = group_at(&runtime, index) {
+    panel.on_restore_group(move |pid| {
+        if let Some((rule_id, pid)) = group_at(&runtime, pid) {
             let _ = sender.send(WorkerCommand::RestoreGroup { rule_id, pid });
         }
     });
     let runtime = state.clone();
     let sender = worker.clone();
-    panel.on_exclude_group(move |index| {
-        if let Some((rule_id, pid)) = group_at(&runtime, index) {
+    panel.on_exclude_group(move |pid| {
+        if let Some((rule_id, pid)) = group_at(&runtime, pid) {
             let _ = sender.send(WorkerCommand::ExcludeGroup { rule_id, pid });
         }
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
-    panel.on_toggle_status(move |index| {
+    panel.on_toggle_status(move |pid| {
         if let Some(panel) = weak.upgrade() {
             // Clicking the open card closes it, so one click is always reversible.
-            let expanded = if panel.get_expanded_status() == index {
+            let expanded = if panel.get_expanded_status_pid() == pid {
                 -1
             } else {
-                index
+                pid
             };
-            panel.set_expanded_status(expanded);
+            panel.set_expanded_status_pid(expanded);
             let statuses = runtime
                 .statuses
                 .lock()
@@ -1002,16 +1001,10 @@ fn install_kill_callbacks(
 ) {
     let runtime = state.clone();
     let weak = panel.as_weak();
-    panel.on_ask_kill(move |source_index| {
-        let Ok(index) = usize::try_from(source_index) else {
-            return;
-        };
-        let Some(process) = runtime
-            .sample
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(index).cloned())
-        else {
+    panel.on_ask_kill(move |pid| {
+        // Resolved by PID rather than by row index, so a sample swapped in between the row being
+        // drawn and the click cannot redirect the confirmation at a different process.
+        let Some(process) = sample_process_by_pid(&runtime, pid) else {
             return;
         };
         if let Ok(mut guard) = runtime.kill_target.lock() {
@@ -1080,7 +1073,7 @@ fn install_kill_callbacks(
 
 /// Appends a rule matching one executable by full path. Shared by the running-app list, the
 /// explorer, and the file picker, so all three produce the same shape of rule.
-fn add_path_rule(state: &RuntimeState, name: &str, path: &Path) {
+fn add_path_rule(state: &RuntimeState, name: &str, path: &Path) -> bool {
     let name = name.to_owned();
     let path = path.to_path_buf();
     mutate_config(state, |config| {
@@ -1096,14 +1089,35 @@ fn add_path_rule(state: &RuntimeState, name: &str, path: &Path) {
             ..Default::default()
         });
     });
+    // `mutate_config` rolls back on a failed write, so the caller must not log a success then.
+    !config_save_failed(state)
+}
+
+/// One process from the most recent sample, found by PID. The explorer passes a PID rather than a
+/// row index, so a sample refreshed between drawing a row and acting on it cannot redirect the
+/// action at a different process. The identity is revalidated again before anything touches it.
+fn sample_process_by_pid(state: &RuntimeState, pid: i32) -> Option<ProcessSample> {
+    let pid = u32::try_from(pid).ok()?;
+    state
+        .sample
+        .lock()
+        .ok()?
+        .iter()
+        .find(|process| process.identity.pid == pid)
+        .cloned()
 }
 
 /// The rule id and root pid of the status row at `index`, or `None` if the list moved underneath a
 /// click, which a background refresh can do at any moment.
-fn group_at(state: &RuntimeState, index: i32) -> Option<(String, u32)> {
-    let index = usize::try_from(index).ok()?;
+/// Resolves a group action target from the root pid the card was drawn for. The status list is
+/// rebuilt and re-sorted on every tick, so the row index a card was rendered at is not a stable
+/// identity: by the time the click arrives that index can belong to a different group, which would
+/// restore or exclude the wrong processes.
+fn group_at(state: &RuntimeState, pid: i32) -> Option<(String, u32)> {
     let guard = state.statuses.lock().ok()?;
-    let status = guard.get(index)?;
+    let status = guard
+        .iter()
+        .find(|status| i32::try_from(status.root.pid).ok() == Some(pid))?;
     Some((status.rule_id.clone(), status.root.pid))
 }
 
@@ -1246,10 +1260,7 @@ fn commit_draft(panel: &ControlPanel, state: &RuntimeState) {
     rule.name = rule.name.trim().to_owned();
     // An exclusion row the user added but left blank is not an error, it is just unused.
     rule.exclusions.retain(RuleMatcher::has_selector);
-    let config = state
-        .config
-        .lock()
-        .map_or_else(|_| AppConfig::default(), |guard| guard.clone());
+    let config = current_config(state);
     if draft.index.is_none() {
         rule.id = unique_rule_id(&config, &slug(&rule.name));
     }
@@ -1285,7 +1296,7 @@ fn commit_draft(panel: &ControlPanel, state: &RuntimeState) {
     );
     set_draft(state, None);
     close_editor(panel);
-    panel.set_page(1);
+    panel.set_page(Page::Processes.index());
     refresh_panel(panel, state);
 }
 
@@ -1311,13 +1322,24 @@ fn validate_rule_against(
 
 fn unique_rule_id(config: &AppConfig, base: &str) -> String {
     let base = if base.is_empty() { "rule" } else { base };
-    let mut id = format!("app-{base}");
-    let mut suffix = 2;
-    while config.rules.iter().any(|rule| rule.id == id) {
-        id = format!("app-{base}-{suffix}");
-        suffix += 1;
+    let taken = |id: &str| config.rules.iter().any(|rule| rule.id == id);
+    let first = format!("app-{base}");
+    if !taken(&first) {
+        return first;
     }
-    id
+    // Bounded rather than an open-ended counter, so a corrupted configuration full of colliding
+    // ids cannot spin forever. The fallback mixes in the wall clock, which makes a collision with
+    // an existing id effectively impossible while still being readable.
+    for suffix in 2..=10_000 {
+        let candidate = format!("app-{base}-{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("app-{base}-{stamp:x}")
 }
 
 fn optional_text(value: &str) -> Option<String> {
@@ -1418,10 +1440,7 @@ fn start_worker(
         let mut previous = HashMap::<(String, u32), ActivityState>::new();
         let mut idle_cycles = 0_u32;
         while !stop.load(Ordering::Acquire) {
-            let config = state
-                .config
-                .lock()
-                .map_or_else(|_| AppConfig::default(), |guard| guard.clone());
+            let config = current_config(&state);
             let processes = sampler.sample();
             let snapshot = sampler.system_snapshot(&processes);
             let candidates_changed = update_candidates(&state, &processes);
@@ -1462,10 +1481,11 @@ fn start_worker(
                     panel.set_user_busy(user_busy);
                     refresh_runtime_panel(&panel, &runtime);
                     // Both models are large, so they are only rebuilt for the visible page.
-                    if panel.get_page() == 1 {
+                    let page = Page::from_index(panel.get_page());
+                    if page == Page::Processes {
                         refresh_process_model(&panel, &runtime);
                     }
-                    if candidates_changed && panel.get_page() == 3 {
+                    if candidates_changed && page == Page::AddApp {
                         refresh_candidate_model(&panel, &runtime);
                     }
                 }
@@ -1512,8 +1532,15 @@ fn handle_worker_command(
                 .file_name()
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
             // Restore first: terminating a suspended process would leave its journal entry
-            // pointing at a dead pid, and a throttled one can be slow to unwind.
-            let _ = engine.restore_group_containing(&identity);
+            // pointing at a dead pid, and a throttled one can be slow to unwind. A failure here is
+            // reported rather than hidden, but the termination still goes ahead because the user
+            // confirmed it and `terminate_process` clears the journal entry for a dead process.
+            if let Err(error) = engine.restore_group_containing(&identity) {
+                push_event(
+                    state,
+                    format!("结束 {name} (PID {}) 前恢复失败：{error}", identity.pid),
+                );
+            }
             match engine.controller_mut().terminate_process(&identity) {
                 Ok(()) => {
                     push_event(state, format!("已手动结束 {name} (PID {})", identity.pid));
@@ -1543,17 +1570,29 @@ fn handle_worker_command(
                 push_event(state, format!("PID {pid} 本次运行不再被管理"));
             }
         }
-        WorkerCommand::Refresh => {}
+        WorkerCommand::Refresh => {
+            // Nothing to do here on purpose. The worker blocks in `recv_timeout` between samples,
+            // so simply receiving this command returns it to the top of the loop and forces an
+            // immediate sample instead of waiting out the interval. That is what both the "刷新"
+            // button and the shutdown path rely on.
+        }
     }
 }
 
-fn join_worker_with_timeout(worker: thread::JoinHandle<()>) {
+/// Waits up to `WORKER_SHUTDOWN_TIMEOUT` for `worker` to finish. Returns an error if it panicked
+/// or was still running when the timeout expired, so the caller can report that the final restore
+/// may not have completed instead of exiting silently. The watchdog is the backstop for that case.
+fn join_worker_with_timeout(worker: thread::JoinHandle<()>) -> Result<(), String> {
     let deadline = Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
     while !worker.is_finished() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
     }
-    if worker.is_finished() {
-        let _ = worker.join();
+    if !worker.is_finished() {
+        return Err("后台线程未在超时内退出，最后一次恢复可能未完成".into());
+    }
+    match worker.join() {
+        Ok(()) => Ok(()),
+        Err(_) => Err("后台线程异常退出，最后一次恢复可能未完成".into()),
     }
 }
 
@@ -1576,11 +1615,24 @@ fn adaptive_sample_interval(
     }
 }
 
+/// The message-loop thread for the restore hotkey. Returns the thread plus the thread id the
+/// loop is running on, which the caller needs to post `WM_QUIT` for a clean shutdown: the loop
+/// blocks in `GetMessageW`, so a stop flag alone would never be observed and the hotkey would stay
+/// registered until the process died.
 fn start_hotkey(
     sender: mpsc::Sender<WorkerCommand>,
     state: RuntimeState,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || unsafe {
+    stop: Arc<AtomicBool>,
+) -> (thread::JoinHandle<()>, Arc<AtomicU32>) {
+    let thread_id = Arc::new(AtomicU32::new(0));
+    let published = thread_id.clone();
+    let handle = thread::spawn(move || unsafe {
+        // Registering a hotkey on this thread requires a message queue, which GetMessageW creates.
+        // Publish the id before the loop so shutdown can always reach us.
+        published.store(GetCurrentThreadId(), Ordering::Release);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
         if RegisterHotKey(
             None,
             HOTKEY_ID,
@@ -1611,7 +1663,21 @@ fn start_hotkey(
             }
         }
         let _ = UnregisterHotKey(None, HOTKEY_ID);
-    })
+    });
+    (handle, thread_id)
+}
+
+/// Ends the hotkey message loop, if it ever started, and waits briefly for it to unwind. A
+/// failure to post is not fatal: the thread also stops once the process exits.
+fn stop_hotkey(thread_id: &Arc<AtomicU32>, handle: thread::JoinHandle<()>) {
+    let id = thread_id.load(Ordering::Acquire);
+    if id != 0 {
+        // SAFETY: `id` is a thread id this process published from its own message loop.
+        let _ = unsafe { PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    }
+    // The hotkey thread owns no process state, so a slow or panicked exit needs no reporting;
+    // only the worker's final restore does.
+    let _ = join_worker_with_timeout(handle);
 }
 
 fn update_candidates(state: &RuntimeState, processes: &[ProcessSample]) -> bool {
@@ -1672,6 +1738,46 @@ fn publish_sample(
     }
     if let Ok(mut guard) = state.snapshot.lock() {
         *guard = snapshot;
+    }
+}
+
+/// The navigation pages, in the order `ui.slint` declares them. The numeric values must match the
+/// `index` of each `NavItem` and the `if root.page == N` blocks there; naming them here is what keeps
+/// the Rust side from drifting a page off, which is how the candidate list once stopped refreshing
+/// when its page was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Overview,
+    Processes,
+    Rules,
+    AddApp,
+    Events,
+    Settings,
+}
+
+impl Page {
+    fn from_index(index: i32) -> Self {
+        match index {
+            0 => Self::Overview,
+            1 => Self::Processes,
+            2 => Self::Rules,
+            3 => Self::AddApp,
+            4 => Self::Events,
+            _ => Self::Settings,
+        }
+    }
+
+    /// The value `ui.slint` expects for `page`. The counterpart of [`Self::from_index`], so a
+    /// navigation jump does not have to spell the number out.
+    const fn index(self) -> i32 {
+        match self {
+            Self::Overview => 0,
+            Self::Processes => 1,
+            Self::Rules => 2,
+            Self::AddApp => 3,
+            Self::Events => 4,
+            Self::Settings => 5,
+        }
     }
 }
 
@@ -1785,20 +1891,13 @@ fn refresh_process_model(panel: &ControlPanel, state: &RuntimeState) {
     let query = panel.get_process_filter().to_string();
     let column = ProcessColumn::from_index(panel.get_process_sort());
     let descending = panel.get_process_descending();
-    let previous_source = panel.get_selected_process_source();
+    let previous_pid = panel.get_selected_process_pid();
     let mut matched = processes
         .iter()
         .filter(|process| process_matches(process, &query))
         .collect::<Vec<_>>();
     sort_processes(&mut matched, column, descending);
 
-    // The source index refers to the unfiltered sample, so a selection survives both filtering and
-    // re-sorting. Anything else would move the row out from under a pending "结束进程" click.
-    let index_of = processes
-        .iter()
-        .enumerate()
-        .map(|(index, process)| (process.identity.pid, index))
-        .collect::<HashMap<_, _>>();
     let rows = matched
         .iter()
         .map(|process| {
@@ -1825,23 +1924,21 @@ fn refresh_process_model(panel: &ControlPanel, state: &RuntimeState) {
                 },
                 managed: managed.contains(&pid),
                 suspended: process.os_suspended,
-                source_index: index_of
-                    .get(&pid)
-                    .and_then(|index| i32::try_from(*index).ok())
-                    .unwrap_or(-1),
             }
         })
         .collect::<Vec<_>>();
+    // The selection is keyed to the PID, so it survives filtering and re-sorting and cannot drift
+    // onto a different process when the sample is replaced.
     let selected_row = rows
         .iter()
-        .position(|row| row.source_index == previous_source)
-        .filter(|_| previous_source >= 0);
+        .position(|row| row.pid == previous_pid)
+        .filter(|_| previous_pid >= 0);
     panel.set_processes(ModelRc::new(VecModel::from(rows)));
     if let Some(row) = selected_row {
         panel.set_selected_process(i32::try_from(row).unwrap_or(-1));
     } else {
         panel.set_selected_process(-1);
-        panel.set_selected_process_source(-1);
+        panel.set_selected_process_pid(-1);
     }
 }
 
@@ -1893,10 +1990,7 @@ fn log_transitions(
 }
 
 fn refresh_panel(panel: &ControlPanel, state: &RuntimeState) {
-    let config = state
-        .config
-        .lock()
-        .map_or_else(|_| AppConfig::default(), |guard| guard.clone());
+    let config = current_config(state);
     panel.set_globally_enabled(config.globally_enabled);
     panel.set_start_with_windows(config.start_with_windows);
     panel.set_config_path(state.config_path.display().to_string().into());
@@ -1962,10 +2056,7 @@ fn system_prefers_dark() -> bool {
 }
 
 fn refresh_runtime_panel(panel: &ControlPanel, state: &RuntimeState) {
-    let config = state
-        .config
-        .lock()
-        .map_or_else(|_| AppConfig::default(), |guard| guard.clone());
+    let config = current_config(state);
     let statuses = state
         .statuses
         .lock()
@@ -1977,6 +2068,7 @@ fn refresh_runtime_panel(panel: &ControlPanel, state: &RuntimeState) {
             state: status.state.label().into(),
             detail: status.detail.clone().into(),
             process_count: i32::try_from(status.process_count).unwrap_or(i32::MAX),
+            pid: i32::try_from(status.root.pid).unwrap_or(-1),
             state_color: state_color(status.state),
             cpu: format!("CPU {:.1}%", status.cpu_percent).into(),
             memory: format_bytes(status.memory_bytes).into(),
@@ -1994,6 +2086,7 @@ fn refresh_runtime_panel(panel: &ControlPanel, state: &RuntimeState) {
         })
         .collect::<Vec<_>>();
     panel.set_statuses(ModelRc::new(VecModel::from(status_rows)));
+    clear_stale_group_selection(panel, &statuses);
     refresh_member_model(panel, &statuses);
     let metrics = state
         .metrics
@@ -2059,11 +2152,30 @@ fn refresh_runtime_panel(panel: &ControlPanel, state: &RuntimeState) {
 
 /// The expanded card's member list. Only one group is ever expanded, so a single model holds the
 /// rows for whichever card that is.
+/// Drops the selected and expanded group when the group it named is gone. Both are keyed on the
+/// root pid, and the status list is rebuilt on every tick, so without this a departed group's
+/// highlight would move onto whichever card takes its row.
+fn clear_stale_group_selection(panel: &ControlPanel, statuses: &[GroupStatus]) {
+    let group_still_present = |pid: i32| {
+        statuses
+            .iter()
+            .any(|status| i32::try_from(status.root.pid).ok() == Some(pid))
+    };
+    let selected = panel.get_selected_status_pid();
+    if selected != -1 && !group_still_present(selected) {
+        panel.set_selected_status_pid(-1);
+    }
+    let expanded = panel.get_expanded_status_pid();
+    if expanded != -1 && !group_still_present(expanded) {
+        panel.set_expanded_status_pid(-1);
+    }
+}
+
 fn refresh_member_model(panel: &ControlPanel, statuses: &[GroupStatus]) {
-    let expanded = panel.get_expanded_status();
-    let members = usize::try_from(expanded)
-        .ok()
-        .and_then(|index| statuses.get(index))
+    let expanded = panel.get_expanded_status_pid();
+    let members = statuses
+        .iter()
+        .find(|status| i32::try_from(status.root.pid).ok() == Some(expanded))
         .map(|status| {
             status
                 .members
@@ -2125,43 +2237,61 @@ fn refresh_tray(tray: &AppTray, state: &RuntimeState) {
     );
 }
 
+/// Refreshes the panel and the tray from a weak handle, tolerating the window already being gone.
+/// Callbacks fire from Slint's event loop while the window can still be torn down underneath them,
+/// so every one of them needs this guard; keeping it in one place avoids the copy-paste drifting.
+fn refresh_from_weak(weak: &Weak<ControlPanel>, tray: &Weak<AppTray>, state: &RuntimeState) {
+    if let Some(panel) = weak.upgrade() {
+        refresh_panel(&panel, state);
+    }
+    if let Some(tray) = tray.upgrade() {
+        refresh_tray(&tray, state);
+    }
+}
+
+/// The panel-only variant, for callbacks that have no tray to update.
+fn refresh_panel_from_weak(weak: &Weak<ControlPanel>, state: &RuntimeState) {
+    if let Some(panel) = weak.upgrade() {
+        refresh_panel(&panel, state);
+    }
+}
+
 fn refresh_candidate_model(panel: &ControlPanel, state: &RuntimeState) {
     let candidates = state
         .candidates
         .lock()
         .map_or_else(|_| Vec::new(), |guard| guard.clone());
     let query = panel.get_app_filter().to_string();
-    let previous_source = panel.get_selected_app_source();
+    let previous_pid = panel.get_selected_app_pid();
+    // The filter runs over every candidate before the display cap is applied, so a search can still
+    // reach entries outside the window and `candidate-total` can report how many were found.
     let matched = candidates
         .iter()
-        .enumerate()
-        .filter(|(_, candidate)| candidate_matches(candidate, &query))
+        .filter(|candidate| candidate_matches(candidate, &query))
+        .collect::<Vec<_>>();
+    panel.set_candidate_total(i32::try_from(matched.len()).unwrap_or(i32::MAX));
+    let listed = matched
+        .into_iter()
         .take(MAX_CANDIDATE_ROWS)
         .collect::<Vec<_>>();
-    // Keep the user's selection if that app is still listed; a background refresh must not clear
-    // it out from under a pending "add rule" click.
-    let selected_row = matched
+    // Keep the user's selection if that app is still listed; a background refresh must not clear it
+    // out from under a pending "add rule" click. Matching on the pid rather than a row index is what
+    // makes that safe, because the list is re-sorted by name on every sample.
+    let selection_survives = listed
         .iter()
-        .position(|(source_index, _)| {
-            i32::try_from(*source_index).unwrap_or(i32::MAX) == previous_source
-        })
-        .filter(|_| previous_source >= 0);
+        .any(|candidate| i32::try_from(candidate.pid).ok() == Some(previous_pid));
     panel.set_apps(ModelRc::new(VecModel::from(
-        matched
+        listed
             .into_iter()
-            .map(|(source_index, candidate)| AppRow {
+            .map(|candidate| AppRow {
                 name: candidate.name.clone().into(),
                 path: candidate.path.display().to_string().into(),
                 pid: i32::try_from(candidate.pid).unwrap_or(i32::MAX),
-                source_index: i32::try_from(source_index).unwrap_or(i32::MAX),
             })
             .collect::<Vec<_>>(),
     )));
-    if let Some(row) = selected_row {
-        panel.set_selected_app(i32::try_from(row).unwrap_or(-1));
-    } else {
-        panel.set_selected_app(-1);
-        panel.set_selected_app_source(-1);
+    if !selection_survives {
+        panel.set_selected_app_pid(-1);
     }
 }
 
@@ -2248,6 +2378,12 @@ fn mutate_rule(state: &RuntimeState, index: i32, mutation: impl FnOnce(&mut Proc
 }
 
 fn mutate_config(state: &RuntimeState, mutation: impl FnOnce(&mut AppConfig)) {
+    if state.config_read_only.load(Ordering::Acquire) {
+        // The file on disk could not be read, so this in-memory copy is a default, not the user's
+        // configuration. Writing it would replace their rules with presets.
+        refuse_config_write(state);
+        return;
+    }
     let result = match state.config.lock() {
         Ok(mut config) => {
             let previous = config.clone();
@@ -2272,6 +2408,10 @@ fn mutate_config(state: &RuntimeState, mutation: impl FnOnce(&mut AppConfig)) {
 }
 
 fn retry_config_save(state: &RuntimeState) {
+    if state.config_read_only.load(Ordering::Acquire) {
+        refuse_config_write(state);
+        return;
+    }
     let result = match state.config.lock() {
         Ok(config) => config.save_atomic(&state.config_path),
         Err(_) => Err(std::io::Error::other("配置锁已损坏")),
@@ -2288,6 +2428,15 @@ fn retry_config_save(state: &RuntimeState) {
     }
 }
 
+/// Reports a refused write. The configuration file could not be read, so the in-memory copy is a
+/// default; writing it would replace whatever the user actually had. Kept as a visible error rather
+/// than a silent no-op, because the setting the user just changed will not survive a restart.
+fn refuse_config_write(state: &RuntimeState) {
+    const MESSAGE: &str = "配置文件无法读取，已停用写入以免覆盖原文件。请修复或删除配置文件后重启";
+    set_save_error(state, MESSAGE.to_owned());
+    push_event(state, MESSAGE.to_owned());
+}
+
 fn set_save_error(state: &RuntimeState, error: String) {
     if let Ok(mut save_error) = state.save_error.lock() {
         *save_error = Some(error);
@@ -2298,6 +2447,30 @@ fn clear_save_error(state: &RuntimeState) {
     if let Ok(mut save_error) = state.save_error.lock() {
         *save_error = None;
     }
+}
+
+/// Whether the most recent [`mutate_config`] failed and therefore rolled its change back. Callers
+/// that report a result to the user use this so a rejected write is never logged as a success.
+fn config_save_failed(state: &RuntimeState) -> bool {
+    state.save_error.lock().is_ok_and(|guard| guard.is_some())
+}
+
+/// The current configuration, or a deliberately inert stand-in if the lock is poisoned.
+///
+/// A poisoned lock means some thread panicked mid-mutation, so the value behind it can no longer be
+/// trusted. Falling back to `AppConfig::default()` would be the dangerous choice: that default has
+/// monitoring on and the built-in presets installed, so a crash could silently start throttling and
+/// suspending processes the user never asked for. This fallback instead keeps monitoring off and
+/// carries no rules, which fails closed until the app is restarted.
+fn current_config(state: &RuntimeState) -> AppConfig {
+    state.config.lock().map_or_else(
+        |_| AppConfig {
+            globally_enabled: false,
+            rules: Vec::new(),
+            ..AppConfig::default()
+        },
+        |guard| guard.clone(),
+    )
 }
 
 fn push_event(state: &RuntimeState, message: String) {
@@ -2455,31 +2628,40 @@ fn import_rules(state: &RuntimeState) -> Result<Option<usize>, String> {
     if imported.is_empty() {
         return Err("文件中没有规则".into());
     }
-    let mut added = 0;
-    let mut failure = None;
-    mutate_config(state, |config| {
-        for mut rule in imported {
-            if config.rules.iter().any(|existing| existing.id == rule.id) {
-                rule.id = unique_rule_id(config, &rule.id);
-            }
-            // An imported preset is no longer the built-in one, so it must stay deletable.
-            rule.built_in = false;
-            config.rules.push(rule);
-            added += 1;
-        }
-        if let Err(error) = config.validate() {
-            failure = Some(error.to_string());
-        }
-    });
-    if let Some(error) = failure {
-        // The rules were already merged, so undo by dropping exactly what was added.
-        mutate_config(state, |config| {
-            let keep = config.rules.len().saturating_sub(added);
-            config.rules.truncate(keep);
-        });
-        return Err(format!("导入的规则无效，已撤销：{error}"));
+    let current = state
+        .config
+        .lock()
+        .map_err(|_| "配置状态已损坏".to_owned())?
+        .clone();
+    // The merge is validated *before* the stored configuration is touched. Validating afterwards
+    // would be too late: `mutate_config` rolls back on a rejected write, and a follow-up "undo"
+    // would then be operating on the restored configuration and truncate the user's own rules.
+    let merged = merge_imported_rules(&current, imported)?;
+    let added = merged.rules.len().saturating_sub(current.rules.len());
+    mutate_config(state, |config| *config = merged);
+    if config_save_failed(state) {
+        // `mutate_config` rolled the change back and is already reporting why.
+        return Err("导入的规则未能写入配置文件".into());
     }
     Ok(Some(added))
+}
+
+/// The pure half of an import: returns `base` with `imported` appended, or an error if the result
+/// would not be a valid configuration. `base` is never modified, so a rejection cannot lose rules.
+fn merge_imported_rules(base: &AppConfig, imported: Vec<ProcessRule>) -> Result<AppConfig, String> {
+    let mut merged = base.clone();
+    for mut rule in imported {
+        if merged.rules.iter().any(|existing| existing.id == rule.id) {
+            rule.id = unique_rule_id(&merged, &rule.id);
+        }
+        // An imported preset is no longer the built-in one, so it must stay deletable.
+        rule.built_in = false;
+        merged.rules.push(rule);
+    }
+    merged
+        .validate()
+        .map_err(|error| format!("导入的规则无效，已忽略：{error}"))?;
+    Ok(merged)
 }
 
 fn read_registry_dword(subkey: &str, name: &str) -> Option<u32> {
@@ -2785,6 +2967,29 @@ fn show_error(message: &str) {
 mod tests {
     use super::*;
 
+    /// A `RuntimeState` pointing at throwaway paths, for the tests that only exercise the shared
+    /// state rather than the files behind it.
+    fn test_state() -> RuntimeState {
+        let root = std::env::temp_dir().join(format!("lazy-process-state-{}", std::process::id()));
+        RuntimeState {
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            statuses: Arc::new(Mutex::new(Vec::new())),
+            candidates: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            metrics: Arc::new(Mutex::new(VecDeque::new())),
+            save_error: Arc::new(Mutex::new(None)),
+            draft: Arc::new(Mutex::new(None)),
+            sample: Arc::new(Mutex::new(Vec::new())),
+            snapshot: Arc::new(Mutex::new(SystemSnapshot::default())),
+            managed_pids: Arc::new(Mutex::new(HashSet::new())),
+            kill_target: Arc::new(Mutex::new(None)),
+            explorer_error: Arc::new(Mutex::new(None)),
+            config_read_only: Arc::new(AtomicBool::new(false)),
+            config_path: root.join("config.json"),
+            event_log_path: root.join("events.log"),
+        }
+    }
+
     #[test]
     fn slug_is_stable() {
         assert_eq!(slug("Windows Terminal.exe"), "windows-terminal-exe");
@@ -2826,10 +3031,14 @@ mod tests {
     }
 
     fn status(state: ActivityState) -> GroupStatus {
+        status_of(state, "rule", 10)
+    }
+
+    fn status_of(state: ActivityState, rule_id: &str, pid: u32) -> GroupStatus {
         GroupStatus {
-            rule_id: "rule".into(),
+            rule_id: rule_id.into(),
             root: lazy_process::model::ProcessIdentity {
-                pid: 10,
+                pid,
                 started_at: 1,
                 started_at_ticks: 1,
                 executable_path: PathBuf::from(r"C:\bin\app.exe"),
@@ -2844,6 +3053,46 @@ mod tests {
             members: Vec::new(),
             next_action: None,
         }
+    }
+
+    /// The regression this guards: a group action used to resolve its target from the row index the
+    /// card was drawn at. The status list is rebuilt and re-sorted on every tick, so between the
+    /// click and the lookup that index could name a different group, and "restore" or "exclude for
+    /// this run" would land on the wrong processes.
+    #[test]
+    fn a_group_action_resolves_by_pid_not_by_row_index() {
+        let state = test_state();
+        // Deliberately not in pid order, so a positional lookup would pick the wrong entry.
+        *state.statuses.lock().unwrap() = vec![
+            status_of(ActivityState::Suspended, "rule-b", 4242),
+            status_of(ActivityState::Suspended, "rule-a", 1111),
+        ];
+        assert_eq!(
+            group_at(&state, 1111),
+            Some(("rule-a".to_owned(), 1111)),
+            "the pid must select its own group regardless of position"
+        );
+        assert_eq!(group_at(&state, 4242), Some(("rule-b".to_owned(), 4242)));
+        // A pid that is no longer present resolves to nothing rather than to a neighbour.
+        assert_eq!(group_at(&state, 9999), None);
+        assert_eq!(group_at(&state, -1), None);
+    }
+
+    #[test]
+    fn a_reordered_status_list_does_not_move_the_selection() {
+        let state = test_state();
+        *state.statuses.lock().unwrap() = vec![
+            status_of(ActivityState::Quiet, "rule-b", 4242),
+            status_of(ActivityState::Quiet, "rule-a", 1111),
+        ];
+        // Row 0 is pid 4242 before the reorder and pid 1111 after it. Keying on the pid means the
+        // same group is still addressed, which is exactly what an index could not promise.
+        assert_eq!(group_at(&state, 4242).unwrap().1, 4242);
+        *state.statuses.lock().unwrap() = vec![
+            status_of(ActivityState::Quiet, "rule-a", 1111),
+            status_of(ActivityState::Quiet, "rule-b", 4242),
+        ];
+        assert_eq!(group_at(&state, 4242).unwrap().1, 4242);
     }
 
     #[test]
@@ -2950,6 +3199,135 @@ mod tests {
             matcher,
             ..Default::default()
         }
+    }
+
+    /// The regression this guards: when the configuration on disk could not be loaded, the app fell
+    /// back to defaults in memory but still wrote them on the next settings change. The event log
+    /// claimed the original file was untouched, while in fact the user's rules were replaced with
+    /// presets. A refused write has to leave the file exactly as it was.
+    #[test]
+    fn a_configuration_that_failed_to_load_is_never_written_over() {
+        let state = test_state();
+        // Simulate the degraded start-up: the file exists but could not be parsed, so the in-memory
+        // copy is a default that must never reach the disk.
+        let original = b"{ this is not the user's config";
+        fs::create_dir_all(state.config_path.parent().unwrap()).unwrap();
+        fs::write(&state.config_path, original).unwrap();
+        state.config_read_only.store(true, Ordering::Release);
+
+        mutate_config(&state, |config| {
+            config.sample_interval_seconds = 9;
+            config.rules.clear();
+        });
+        assert_eq!(
+            fs::read(&state.config_path).unwrap(),
+            original,
+            "a refused write must leave the unreadable file untouched"
+        );
+        // The refusal is reported rather than silently swallowed.
+        assert!(config_save_failed(&state));
+        assert!(
+            state
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.message.contains("覆盖")),
+            "the user must be told the write was refused"
+        );
+
+        // `retry_config_save` is the other write path and must refuse for the same reason.
+        retry_config_save(&state);
+        assert_eq!(fs::read(&state.config_path).unwrap(), original);
+
+        // Once the file is readable again the guard is lifted and writes proceed.
+        state.config_read_only.store(false, Ordering::Release);
+        mutate_config(&state, |config| {
+            config.sample_interval_seconds = 9;
+        });
+        assert_ne!(fs::read(&state.config_path).unwrap(), original);
+        assert!(!config_save_failed(&state));
+
+        fs::remove_dir_all(state.config_path.parent().unwrap()).unwrap();
+    }
+
+    /// The regression this guards: a rejected import used to be "undone" by truncating the rule
+    /// list *after* `mutate_config` had already rolled back, which deleted the user's own rules.
+    #[test]
+    fn a_rejected_import_leaves_the_existing_rules_untouched() {
+        let base = AppConfig {
+            rules: vec![
+                draft_rule(RuleMatcher {
+                    process_name: Some("keep-me.exe".into()),
+                    ..Default::default()
+                }),
+                draft_rule(RuleMatcher {
+                    process_name: Some("keep-me-too.exe".into()),
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        };
+        // An invalid rule: no selector at all, so the merged configuration cannot validate.
+        let invalid = ProcessRule {
+            id: "imported".into(),
+            name: "Imported".into(),
+            ..Default::default()
+        };
+        let error = merge_imported_rules(&base, vec![invalid])
+            .expect_err("an import without a selector must be rejected");
+        assert!(error.contains("无效"), "unexpected error: {error}");
+        // The pure merge cannot touch `base`, which is exactly why the original data survives.
+        assert_eq!(base.rules.len(), 2);
+        assert!(base.rules.iter().any(|rule| rule.id == "app-test"));
+    }
+
+    #[test]
+    fn an_import_renames_colliding_ids_instead_of_overwriting() {
+        let base = AppConfig {
+            rules: vec![draft_rule(RuleMatcher {
+                process_name: Some("existing.exe".into()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let incoming = ProcessRule {
+            id: "app-test".into(),
+            name: "Incoming".into(),
+            matcher: RuleMatcher {
+                process_name: Some("incoming.exe".into()),
+                ..Default::default()
+            },
+            built_in: true,
+            ..Default::default()
+        };
+        let merged = merge_imported_rules(&base, vec![incoming]).expect("a valid import merges");
+        assert_eq!(merged.rules.len(), 2);
+        // The existing rule keeps its id and its name; the import is renamed and made deletable.
+        assert_eq!(merged.rules[0].name, "Test");
+        assert_eq!(merged.rules[1].name, "Incoming");
+        assert_ne!(merged.rules[1].id, "app-test");
+        assert!(!merged.rules[1].built_in);
+    }
+
+    /// A poisoned configuration lock must fail closed. Falling back to `AppConfig::default()` would
+    /// turn monitoring back on with the built-in presets, which is the opposite of safe.
+    #[test]
+    fn a_poisoned_config_lock_disables_monitoring_instead_of_restoring_defaults() {
+        let state = test_state();
+        let poisoned = Arc::clone(&state.config);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("lock for poisoning");
+            panic!("poison the configuration lock");
+        });
+        assert!(state.config.lock().is_err(), "the lock should be poisoned");
+
+        let config = current_config(&state);
+        assert!(!config.globally_enabled, "monitoring must stay off");
+        assert!(
+            config.rules.is_empty(),
+            "no preset may be installed behind the user's back"
+        );
     }
 
     #[test]
@@ -3243,6 +3621,43 @@ mod tests {
         assert!(!process_matches(&process, "notepad"));
     }
 
+    /// The page numbers exist in two files: the `NavItem` indices in `ui.slint` and this enum. They
+    /// drifted once, which silently stopped the candidate list from refreshing when its page opened.
+    /// Reading the UI source keeps them pinned together, so reordering a page fails here instead.
+    #[test]
+    fn the_page_indices_match_the_navigation_in_the_ui() {
+        let ui = include_str!("ui.slint");
+        // Each entry pairs the enum variant with the label its `NavItem` carries.
+        let expected = [
+            (Page::Overview, "概览"),
+            (Page::Processes, "进程"),
+            (Page::Rules, "应用规则"),
+            (Page::AddApp, "添加应用"),
+            (Page::Events, "事件日志"),
+            (Page::Settings, "设置"),
+        ];
+        for (index, (page, label)) in expected.iter().enumerate() {
+            assert_eq!(
+                Page::from_index(i32::try_from(index).unwrap()),
+                *page,
+                "index {index} must map to {label}"
+            );
+            let nav = format!(r#"NavItem {{ label: "{label}"; index: {index};"#);
+            assert!(
+                ui.contains(&nav),
+                "ui.slint must still declare {label} at index {index}"
+            );
+            let block = format!("if root.page == {index} :");
+            assert!(
+                ui.contains(&block),
+                "ui.slint must still render page {index}"
+            );
+        }
+        // An out-of-range index falls back to the last page rather than panicking.
+        assert_eq!(Page::from_index(99), Page::Settings);
+        assert_eq!(Page::from_index(-1), Page::Settings);
+    }
+
     #[test]
     fn a_new_sort_column_starts_descending_only_where_that_reads_better() {
         assert!(ProcessColumn::from_index(2).defaults_to_descending());
@@ -3271,6 +3686,57 @@ mod tests {
             message: "app.exe (PID 10) → 低耗".into(),
         };
         assert!(!routine.is_error());
+    }
+
+    /// `EventEntry::is_error` classifies by wording, not by a flag, so that entries reloaded from an
+    /// older log file are still highlighted. That only works while every failure message carries one
+    /// of the markers. This walks the production source and fails if a `push_event` that reports an
+    /// error does not, so adding one without a marker is caught here instead of silently losing its
+    /// highlight.
+    #[test]
+    fn every_failure_message_carries_an_error_marker() {
+        const MARKERS: [&str; 4] = ["失败", "出错", "无法", "已停用"];
+        let source = include_str!("main.rs");
+        // Only the production half. The test module below this marker contains its own copies of
+        // these strings, and scanning them would make the test inspect itself. The marker includes
+        // `mod tests` so that a mere mention of the attribute in a comment cannot truncate the scan
+        // early and silently stop checking the rest of the file.
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(source, |(before, _)| before);
+        let lines = production.lines().collect::<Vec<_>>();
+        let mut checked = 0;
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("push_event") {
+                continue;
+            }
+            // Join the call up to and including the line that closes it, so a message split across
+            // several lines is examined as one string.
+            let mut call = String::new();
+            for line in lines.iter().skip(index).take(6) {
+                call.push_str(line);
+                call.push(' ');
+                if line.contains(");") {
+                    break;
+                }
+            }
+            // Only messages that actually report a failure need a marker.
+            let reports_failure = call.contains("{error}")
+                || call.contains("错误")
+                || call.contains("异常")
+                || call.contains("超时");
+            if !reports_failure {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                MARKERS.iter().any(|marker| call.contains(marker)),
+                "line {}: failure event without an error marker: {}",
+                index + 1,
+                call.trim()
+            );
+        }
+        assert!(checked > 0, "the scan found no failure events to check");
     }
 
     #[test]

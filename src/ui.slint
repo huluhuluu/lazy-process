@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, Palette, ScrollView } from "std-widgets.slint";
 
 // One switch drives every colour in the window. Rust only sets `dark`; the palettes below are
 // derived from it, so no call site has to know a colour value.
@@ -25,6 +25,13 @@ export global Theme {
     out property <color> scrim: dark ? #05090880 : #1d2922aa;
     // The sidebar logo tile and badges keep a solid accent behind on-accent text.
     out property <color> accent-fill: dark ? #2f8f5c : #22784a;
+
+    // The built-in widgets (`Button`, `CheckBox`, `LineEdit`, `ScrollView`) ignore the colours above
+    // and read Slint's own `Palette`, which follows the *operating system* scheme. Choosing dark
+    // inside the app while Windows sat in light mode therefore left every built-in control drawing
+    // dark text on our dark background. `Palette.color-scheme` cannot be assigned from a component
+    // body, but it can be aliased here and driven from Rust through this property.
+    in-out property <ColorScheme> widget-color-scheme <=> Palette.color-scheme;
 }
 
 export struct RuleRow {
@@ -82,6 +89,11 @@ export struct ProcessRow {
     pid: int,
     name: string,
     path: string,
+    // Full command line as the OS reports it. Shown in the detail card, because the process name
+    // alone rarely says which of several instances this is.
+    command: string,
+    // Parent PID, already formatted, or "—" when the parent has exited.
+    parent: string,
     cpu: string,
     memory: string,
     threads: int,
@@ -307,6 +319,7 @@ export component ControlPanel inherits Window {
     in property <string> sample-interval-text: "";
     in property <string> cpu-threshold-text: "";
     in property <string> io-threshold-text: "";
+    in property <string> text-scale-text: "";
     in property <string> chart-window-text: "";
     // 0 system, 1 light, 2 dark. Kept separate from Theme.dark, which is the resolved value.
     in property <int> theme-choice: 0;
@@ -380,6 +393,7 @@ export component ControlPanel inherits Window {
     callback adjust-sample-interval(int);
     callback adjust-cpu-threshold(int);
     callback adjust-io-threshold(int);
+    callback adjust-text-scale(int);
     callback open-event-log();
     callback clear-event-log();
     callback add-app(int);
@@ -403,6 +417,8 @@ export component ControlPanel inherits Window {
     callback exclude-group(int);
     callback toggle-status(int);
     callback add-process-rule(int);
+    callback copy-command(string);
+    callback reveal-path(string);
 
     HorizontalLayout {
         spacing: 0px;
@@ -813,6 +829,46 @@ export component ControlPanel inherits Window {
                                 font-size: 10px;
                                 wrap: word-wrap;
                             }
+                            // Details for the selected row. The columns above have to stay narrow to
+                            // fit the table, so the executable path and the full command line — the
+                            // two things that actually tell two same-named processes apart — live
+                            // here instead. The row is read straight from the model by index, so it
+                            // appears as soon as the selection changes rather than on the next sample.
+                            if root.selected-process >= 0 && root.selected-process < root.processes.length : Rectangle {
+                                height: 82px;
+                                vertical-stretch: 0;
+                                background: Theme.surface-sunken;
+                                border-width: 1px;
+                                border-color: Theme.border-soft;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 9px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text { text: root.processes[root.selected-process].name; color: Theme.ink; font-size: 11px; font-weight: 700; vertical-alignment: center; overflow: elide; }
+                                        Text { text: "PID " + root.processes[root.selected-process].pid; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                                        Text { text: "父进程 " + root.processes[root.selected-process].parent; color: Theme.ink-faint; font-size: 10px; vertical-alignment: center; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Button { text: "复制命令行"; clicked => { root.copy-command(root.processes[root.selected-process].command); } }
+                                        Button { text: "打开所在文件夹"; clicked => { root.reveal-path(root.processes[root.selected-process].path); } }
+                                    }
+                                    Text {
+                                        text: "路径  " + root.processes[root.selected-process].path;
+                                        color: Theme.ink-muted;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: "命令行  " + (root.processes[root.selected-process].command == "" ? "（系统未提供）" : root.processes[root.selected-process].command);
+                                        color: Theme.ink-muted;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1014,7 +1070,7 @@ export component ControlPanel inherits Window {
                     Text { text: "设置"; color: Theme.ink; font-size: 21px; font-weight: 700; }
                     Text { text: "阈值对所有规则生效：一个进程组的 CPU 与 I/O 必须同时低于阈值才开始累计静默时间。"; color: Theme.ink-soft; font-size: 12px; wrap: word-wrap; }
                     Rectangle {
-                        height: 148px;
+                        height: 188px;
                         vertical-stretch: 0;
                         background: Theme.surface;
                         border-width: 1px;
@@ -1043,6 +1099,13 @@ export component ControlPanel inherits Window {
                                 hint: "每次采样之间允许的读写量";
                                 decrease => { root.adjust-io-threshold(-1); }
                                 increase => { root.adjust-io-threshold(1); }
+                            }
+                            SettingRow {
+                                label: "界面缩放";
+                                value: root.text-scale-text;
+                                hint: "也可按住 Ctrl 滚动鼠标滚轮";
+                                decrease => { root.adjust-text-scale(-1); }
+                                increase => { root.adjust-text-scale(1); }
                             }
                         }
                     }

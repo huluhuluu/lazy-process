@@ -17,18 +17,24 @@ directories = "6.0.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray"] }
+# `unstable-winit-030` exposes `slint::winit_030::WinitWindowAccessor`, which the panel uses to
+# intercept Ctrl + mouse wheel before the ScrollView turns it into scrolling. The trait name carries
+# the winit version, so bumping winit means revisiting that code.
+slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray", "unstable-winit-030"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",

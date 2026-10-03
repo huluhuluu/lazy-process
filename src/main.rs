@@ -4,27 +4,41 @@ slint::include_modules!();
 
 use lazy_process::{
     config::{
-        AppConfig, ProcessRule, RuleMatcher, ThemePreference, config_path, event_log_path,
-        journal_path, journal_recovery_paths,
+        AppConfig, MAX_TEXT_SCALE, MIN_TEXT_SCALE, ProcessRule, RuleMatcher, TEXT_SCALE_STEP,
+        ThemePreference, config_path, event_log_path, journal_path, journal_recovery_paths,
     },
     engine::{Engine, TickContext, preview_rule},
     model::{ActivityState, GroupStatus, ProcessIdentity, ProcessSample, SystemSnapshot},
     platform::{
         ProcessSampler, WatchdogRecovery, WindowsResourceController, acquire_application_lease,
-        foreground_process_id, local_minute_and_weekday, recover_all_suspended,
-        run_elevated_helper, run_watchdog, spawn_watchdog, user_is_busy,
+        copy_text_to_clipboard, foreground_process_id, local_minute_and_weekday,
+        recover_all_suspended, reveal_in_explorer, run_elevated_helper, run_watchdog,
+        spawn_watchdog, user_is_busy,
     },
 };
-use slint::{CloseRequestResponse, Color, ComponentHandle, ModelRc, VecModel, Weak};
+use slint::{
+    CloseRequestResponse, Color, ComponentHandle, ModelRc, Timer, TimerMode, VecModel, Weak,
+    language::ColorScheme,
+    platform::WindowEvent as SlintWindowEvent,
+    winit_030::{
+        EventResult, WinitWindowAccessor, winit,
+        winit::{
+            event::{MouseScrollDelta, WindowEvent},
+            keyboard::{Key, KeyCode, ModifiersState, PhysicalKey},
+            platform::windows::MonitorHandleExtWindows,
+        },
+    },
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    ffi::OsString,
+    ffi::{OsString, c_void},
     fmt::Write as _,
     fs,
     io::Write as _,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -39,6 +53,7 @@ use windows::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError,
             HANDLE, LPARAM, SetLastError, WAIT_OBJECT_0, WPARAM,
         },
+        Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO},
         System::{
             Registry::{
                 HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -75,6 +90,11 @@ const RUN_VALUE: &str = "LazyProcess";
 const EVENT_HISTORY: usize = 200;
 /// Above this the log is rewritten with only the entries the panel would show.
 const EVENT_LOG_MAX_BYTES: u64 = 512 * 1024;
+/// How long the zoom settles before it is written to disk. Saving rewrites and flushes the whole
+/// configuration — measured at ~96 ms — so a flick of the wheel must not write once per notch.
+const TEXT_SCALE_SAVE_DELAY: Duration = Duration::from_millis(600);
+/// Pixel travel that counts as one wheel detent, for the precision touchpads that report pixels.
+const PIXELS_PER_NOTCH: f64 = 40.0;
 
 #[derive(Clone)]
 struct RuntimeState {
@@ -94,6 +114,10 @@ struct RuntimeState {
     /// The process a kill confirmation is waiting on.
     kill_target: Arc<Mutex<Option<ProcessIdentity>>>,
     explorer_error: Arc<Mutex<Option<String>>>,
+    /// The zoom the window is actually showing. Kept apart from `config` because the two differ
+    /// while a change waits out its save delay: stepping the zoom reads this, never the saved value,
+    /// or a flick of the wheel would accumulate from a base that lags several notches behind.
+    applied_text_scale: Arc<Mutex<f32>>,
     /// Set when the configuration on disk could not be loaded, so the in-memory copy is a default
     /// standing in for a file we refused to overwrite. Saving in that state would replace the user's
     /// rules with presets, so every write is refused until the file is fixed by hand.
@@ -225,6 +249,8 @@ fn run() -> Result<(), String> {
     if !recovery_errors.is_empty() {
         config.globally_enabled = false;
     }
+    // Read before `config` is moved into the state below.
+    let initial_text_scale = config.text_scale;
     let state = RuntimeState {
         config: Arc::new(Mutex::new(config)),
         statuses: Arc::new(Mutex::new(Vec::new())),
@@ -238,6 +264,7 @@ fn run() -> Result<(), String> {
         managed_pids: Arc::new(Mutex::new(HashSet::new())),
         kill_target: Arc::new(Mutex::new(None)),
         explorer_error: Arc::new(Mutex::new(None)),
+        applied_text_scale: Arc::new(Mutex::new(initial_text_scale)),
         // A failed load means the in-memory configuration is a default standing in for a file we
         // must not overwrite, so saving stays disabled until the user fixes the file.
         config_read_only: Arc::new(AtomicBool::new(config_error.is_some())),
@@ -265,13 +292,18 @@ fn run() -> Result<(), String> {
     let tray = AppTray::new().map_err(|error| error.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let (worker_tx, worker_rx) = mpsc::channel();
+    // Shared by the settings buttons and the wheel/keyboard shortcuts, so both debounce into one
+    // pending save. Created here because the callbacks are installed before the window is shown.
+    let zoom_timer = Rc::new(Timer::default());
 
-    install_callbacks(&panel, &tray, &state, &worker_tx, &stop);
+    install_callbacks(&panel, &tray, &state, &worker_tx, &stop, &zoom_timer);
     panel
         .window()
         .on_close_requested(|| CloseRequestResponse::HideWindow);
     refresh_panel(&panel, &state);
     panel.show().map_err(|error| error.to_string())?;
+    // After the first show, so that the winit window the zoom reads its display factor from exists.
+    install_text_zoom(&panel, &state, Rc::clone(&zoom_timer));
 
     let worker = start_worker(
         panel.as_weak(),
@@ -284,6 +316,9 @@ fn run() -> Result<(), String> {
     let (hotkey, hotkey_thread_id) = start_hotkey(worker_tx.clone(), state.clone(), stop.clone());
     start_show_panel_watcher(panel.as_weak(), stop.clone());
     slint::run_event_loop().map_err(|error| error.to_string())?;
+    // Before anything else: a zoom changed in the last moments is still waiting out its save delay,
+    // and quitting is exactly when losing it would be noticed.
+    flush_pending_text_scale(&state);
     stop.store(true, Ordering::Release);
     let _ = worker_tx.send(WorkerCommand::Refresh);
     stop_hotkey(&hotkey_thread_id, hotkey);
@@ -370,6 +405,7 @@ fn install_callbacks(
     state: &RuntimeState,
     worker: &mpsc::Sender<WorkerCommand>,
     stop: &Arc<AtomicBool>,
+    zoom_timer: &Rc<Timer>,
 ) {
     let weak = panel.as_weak();
     tray.on_open(move || show_panel(&weak));
@@ -443,7 +479,7 @@ fn install_callbacks(
 
     install_rule_callbacks(panel, state);
     install_editor_callbacks(panel, state);
-    install_settings_callbacks(panel, state);
+    install_settings_callbacks(panel, state, zoom_timer);
     install_explorer_callbacks(panel, state, worker);
 
     let runtime = state.clone();
@@ -814,7 +850,7 @@ fn install_exclusion_callbacks(panel: &ControlPanel, state: &RuntimeState) {
     });
 }
 
-fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState) {
+fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState, zoom_timer: &Rc<Timer>) {
     let runtime = state.clone();
     let weak = panel.as_weak();
     panel.on_adjust_sample_interval(move |delta| {
@@ -840,6 +876,26 @@ fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState) {
                 step_io_threshold(config.io_quiet_bytes_per_sample, delta);
         });
         refresh_panel_from_weak(&weak, &runtime);
+    });
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    let zoom_timer = Rc::clone(zoom_timer);
+    panel.on_adjust_text_scale(move |delta| {
+        let Some(panel) = weak.upgrade() else {
+            return;
+        };
+        let window = panel.window();
+        let base_scale = display_scale_factor(window);
+        let current = applied_text_scale(&runtime);
+        // The row keeps its own state in step with the window, so no full refresh is needed here.
+        set_zoom(
+            window,
+            &runtime,
+            &weak,
+            &zoom_timer,
+            base_scale,
+            current * TEXT_SCALE_STEP.powi(delta),
+        );
     });
     let runtime = state.clone();
     let weak = panel.as_weak();
@@ -989,6 +1045,26 @@ fn install_explorer_callbacks(
                 .lock()
                 .map_or_else(|_| Vec::new(), |guard| guard.clone());
             refresh_member_model(&panel, &statuses);
+        }
+    });
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    panel.on_copy_command(move |command| {
+        if let Err(error) = copy_text_to_clipboard(command.as_str()) {
+            if let Some(panel) = weak.upgrade() {
+                panel.set_explorer_error(error.clone().into());
+            }
+            set_explorer_error(&runtime, error);
+        }
+    });
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    panel.on_reveal_path(move |path| {
+        if let Err(error) = reveal_in_explorer(Path::new(path.as_str())) {
+            if let Some(panel) = weak.upgrade() {
+                panel.set_explorer_error(error.clone().into());
+            }
+            set_explorer_error(&runtime, error);
         }
     });
 }
@@ -1911,6 +1987,11 @@ fn refresh_process_model(panel: &ControlPanel, state: &RuntimeState) {
                     .display()
                     .to_string()
                     .into(),
+                command: process.command_line.clone().into(),
+                parent: process
+                    .parent_pid
+                    .map_or_else(|| "—".to_owned(), |parent| parent.to_string())
+                    .into(),
                 cpu: format!("{:.1}%", process.cpu_percent).into(),
                 memory: format_bytes(process.memory_bytes).into(),
                 threads: i32::try_from(process.thread_count).unwrap_or(i32::MAX),
@@ -1998,6 +2079,9 @@ fn refresh_panel(panel: &ControlPanel, state: &RuntimeState) {
     panel.set_sample_interval_text(format!("{} 秒", config.sample_interval_seconds).into());
     panel.set_cpu_threshold_text(format!("{:.1}%", config.cpu_quiet_percent).into());
     panel.set_io_threshold_text(format_bytes(config.io_quiet_bytes_per_sample).into());
+    // The applied zoom, not the saved one: a change still waiting out its save delay is already on
+    // screen, and an unrelated refresh must not snap the row back to the value on disk.
+    panel.set_text_scale_text(format_text_scale(applied_text_scale(state)).into());
     panel.set_pause_while_fullscreen(config.pause_while_fullscreen);
     apply_theme(panel, config.theme);
     panel.set_candidate_cap(i32::try_from(MAX_CANDIDATE_ROWS).unwrap_or(i32::MAX));
@@ -2043,6 +2127,14 @@ fn apply_theme(panel: &ControlPanel, preference: ThemePreference) {
         ThemePreference::System => system_prefers_dark(),
     };
     panel.global::<Theme>().set_dark(dark);
+    // The built-in widgets read Slint's `Palette`, not the `Theme` colours above, and that palette
+    // follows the operating system by default. Without this the app's own Dark choice would leave
+    // every `Button`/`LineEdit`/`ScrollView` drawing its light-mode ink on our dark background.
+    panel.global::<Theme>().set_widget_color_scheme(if dark {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    });
 }
 
 /// Windows records the app colour mode as `AppsUseLightTheme`, where 0 means dark. A missing value
@@ -2053,6 +2145,426 @@ fn system_prefers_dark() -> bool {
         "AppsUseLightTheme",
     )
     .is_some_and(|value| value == 0)
+}
+
+/// The zoom actions the keyboard can trigger: `Ctrl` + `+`/`=` steps in, `Ctrl` + `-` steps out and
+/// `Ctrl` + `0` goes back to the display's own scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoomKey {
+    Step(i32),
+    Reset,
+}
+
+/// Maps a key press to a zoom action.
+///
+/// The physical key is what decides, so that the shortcuts keep working on layouts where `+` and `-`
+/// need a different modifier, and so that the numpad keys are recognised as the same actions. The
+/// character is only a fallback for the rare key winit cannot name physically.
+fn zoom_key(physical: PhysicalKey, logical: &Key) -> Option<ZoomKey> {
+    match physical {
+        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => Some(ZoomKey::Step(1)),
+        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => Some(ZoomKey::Step(-1)),
+        PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0) => Some(ZoomKey::Reset),
+        // `KeyCode` is non-exhaustive and covers every key on the keyboard, so the fallback below
+        // runs for all of the ones that are not zoom shortcuts.
+        _ => match logical {
+            Key::Character(text) => match text.as_str() {
+                "+" | "=" => Some(ZoomKey::Step(1)),
+                "-" | "_" => Some(ZoomKey::Step(-1)),
+                "0" => Some(ZoomKey::Reset),
+                _ => None,
+            },
+            _ => None,
+        },
+    }
+}
+
+/// Turns a wheel event into a zoom step. One event never becomes more than one step however far the
+/// wheel travelled, so a fast flick stays even: it arrives as several events, not one large delta.
+///
+/// `accumulated` carries the leftover travel between calls and is only used for the pixel deltas a
+/// precision touchpad sends. Those arrive as a fine stream — many per gesture, a few pixels each — so
+/// stepping on every one would cross the whole zoom range in a single flick. Banking the travel and
+/// spending it a detent at a time keeps the gesture proportional to how far the fingers moved.
+fn wheel_notches(delta: &MouseScrollDelta, accumulated: &mut f64) -> i32 {
+    match delta {
+        // Windows reports whole detents here, so only the direction matters.
+        MouseScrollDelta::LineDelta(_, vertical) => sign_of(f64::from(*vertical)),
+        MouseScrollDelta::PixelDelta(position) => {
+            *accumulated += position.y;
+            let notches = (*accumulated / PIXELS_PER_NOTCH).trunc();
+            if notches == 0.0 {
+                return 0;
+            }
+            // Keep the remainder rather than clearing it, or a slow scroll would round to nothing.
+            *accumulated -= notches * PIXELS_PER_NOTCH;
+            sign_of(notches)
+        }
+    }
+}
+
+fn sign_of(delta: f64) -> i32 {
+    if delta > 0.0 {
+        1
+    } else if delta < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// A display scale factor is a small positive number, so narrowing winit's `f64` to the `f32` Slint
+/// works in cannot lose anything a monitor reports.
+#[allow(clippy::cast_possible_truncation)]
+fn scale_factor_to_f32(scale_factor: f64) -> f32 {
+    scale_factor as f32
+}
+
+/// The display's own scale factor, read from winit rather than from Slint.
+///
+/// Slint's value is the display's factor multiplied by whatever zoom is in effect, so using it as the
+/// base of the next step would compound and drift. winit's copy is untouched by the override, which
+/// makes it the only value that can be multiplied repeatedly.
+fn display_scale_factor(window: &slint::Window) -> f32 {
+    window
+        .with_winit_window(|winit_window| scale_factor_to_f32(winit_window.scale_factor()))
+        .unwrap_or_else(|| window.scale_factor())
+}
+
+/// A work area as `(left, top, right, bottom)` in physical pixels.
+type WorkArea = (i32, i32, i32, i32);
+/// A window frame's width and height in physical pixels.
+type FrameSize = (i32, i32);
+
+/// The work area — the screen minus the taskbar and any other appbar — of the monitor the window is
+/// on, together with the size of the window's frame, which the zoom does not grow.
+fn work_area_and_frame(window: &slint::Window) -> Option<(WorkArea, FrameSize)> {
+    window
+        .with_winit_window(|winit_window| {
+            let monitor = winit_window.current_monitor()?;
+            let mut info = MONITORINFO {
+                cbSize: u32::try_from(size_of::<MONITORINFO>()).ok()?,
+                ..MONITORINFO::default()
+            };
+            // SAFETY: the handle names the monitor this live window is on, and `info` is a live
+            // `MONITORINFO` with `cbSize` filled in, which is exactly what the call writes into.
+            let read = unsafe {
+                GetMonitorInfoW(HMONITOR(monitor.hmonitor() as *mut c_void), &raw mut info)
+            };
+            if !read.as_bool() {
+                return None;
+            }
+            let inner = winit_window.inner_size();
+            let outer = winit_window.outer_size();
+            Some((
+                (
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ),
+                (
+                    i32::try_from(outer.width.saturating_sub(inner.width)).unwrap_or(i32::MAX),
+                    i32::try_from(outer.height.saturating_sub(inner.height)).unwrap_or(i32::MAX),
+                ),
+            ))
+        })
+        .flatten()
+}
+
+/// The window's layout size at 100% zoom, mirroring `preferred-width`/`preferred-height` in
+/// `ui.slint`. The zoom multiplies exactly this, so it is what the ceiling is measured against.
+const BASE_WINDOW_WIDTH: f32 = 980.0;
+const BASE_WINDOW_HEIGHT: f32 = 680.0;
+
+/// The largest zoom whose window still fits a work area, given the window frame that does not follow
+/// the zoom. Split out from the display reading so the arithmetic can be tested on its own.
+#[allow(clippy::cast_precision_loss)]
+fn ceiling_from_work_area(work: WorkArea, frame: FrameSize, base_scale: f32) -> Option<f32> {
+    if base_scale <= 0.0 {
+        return None;
+    }
+    let fit = (((work.2 - work.0) - frame.0) as f32 / BASE_WINDOW_WIDTH)
+        .min(((work.3 - work.1) - frame.1) as f32 / BASE_WINDOW_HEIGHT);
+    Some(fit / base_scale)
+}
+
+/// The largest zoom whose window still fits the monitor's work area, or `None` when the display
+/// cannot be read.
+///
+/// The zoom grows the window in step with the factor, which is what keeps the layout's logical size
+/// unchanged. On a display not much larger than the window itself, that runs the bottom of the
+/// window — the settings row that changes the zoom — off the screen, where it cannot be reached to
+/// undo. Measuring the grown window, frame included, against the work area keeps every row reachable.
+///
+/// The design size is used rather than the window's current size so that resizing the window by hand
+/// never feeds back into the zoom; the ceiling then depends only on the display and the DPI.
+fn text_scale_ceiling(window: &slint::Window, base_scale: f32) -> Option<f32> {
+    let (work, frame) = work_area_and_frame(window)?;
+    ceiling_from_work_area(work, frame, base_scale)
+}
+
+/// The requested zoom, held down to the largest one whose window still fits the display.
+///
+/// Recomputed on every use rather than cached, so moving to a larger display gives the zoom its
+/// range back.
+fn fitted_text_scale(window: &slint::Window, base_scale: f32, requested: f32) -> f32 {
+    text_scale_ceiling(window, base_scale).map_or(requested, |ceiling| {
+        requested.min(ceiling).max(MIN_TEXT_SCALE)
+    })
+}
+
+/// Walks the window back inside the work area once it has been grown near an edge.
+///
+/// Growing the window is not enough on its own: the factor the backend converts the window's stored
+/// position with changes with the zoom, so the window also drifts down and to the right, and the rows
+/// the zoom just made room for would land behind the taskbar or off the display entirely. Only the
+/// position is touched here, and only when it is actually outside, so a window the user has placed
+/// where they want it is left alone.
+fn keep_window_on_screen(window: &slint::Window) {
+    let Some((work, _)) = work_area_and_frame(window) else {
+        return;
+    };
+    window.with_winit_window(|winit_window| {
+        let Ok(position) = winit_window.outer_position() else {
+            return;
+        };
+        let size = winit_window.outer_size();
+        let limit_x = work.2 - i32::try_from(size.width).unwrap_or(i32::MAX);
+        let limit_y = work.3 - i32::try_from(size.height).unwrap_or(i32::MAX);
+        let x = position.x.clamp(work.0, limit_x.max(work.0));
+        let y = position.y.clamp(work.1, limit_y.max(work.1));
+        if (x, y) != (position.x, position.y) {
+            winit_window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
+    });
+}
+
+/// Applies the text zoom to a live window.
+///
+/// Slint scales the whole interface — text, padding, icons — by the window's scale factor, so raising
+/// that factor is what makes the interface bigger, and it stays inside the renderer's normal
+/// rasterisation, which keeps text sharp instead of stretching it.
+///
+/// Raising the factor on its own is not enough. The backend converts the window's logical size back to
+/// physical pixels with winit's factor, which knows nothing about the override, so the window would
+/// keep its physical size and the layout would be squeezed into it instead of growing. Setting the
+/// physical size here keeps the logical layout exactly as it was.
+fn apply_text_scale(window: &slint::Window, base_scale: f32, text_scale: f32) {
+    let factor = base_scale * text_scale;
+    if (factor - window.scale_factor()).abs() < 0.001 {
+        return;
+    }
+    // A maximized or fullscreen window is sized by the system, so it has no room to grow. The resize
+    // event that restoring the window sends picks the zoom up again.
+    if window.is_fullscreen() || window.is_maximized() {
+        return;
+    }
+    let logical = window.size().to_logical(window.scale_factor());
+    if logical.width < 1.0 || logical.height < 1.0 {
+        // The backend has not reported a size yet; the first resize event applies the zoom instead.
+        return;
+    }
+    // The factor changes first, so that the size reported back below is converted to logical pixels
+    // with the new factor and the layout therefore keeps its size.
+    if window
+        .try_dispatch_event(SlintWindowEvent::ScaleFactorChanged {
+            scale_factor: factor,
+        })
+        .is_err()
+    {
+        return;
+    }
+    window.set_size(clamp_to_work_area(window, logical.to_physical(factor)));
+    // The position is converted with the same factor, so growing the window also walks it down and to
+    // the right; pulling it back keeps the rows the zoom just made room for on the display.
+    keep_window_on_screen(window);
+}
+
+/// Holds a wanted window size down to what the work area can hold.
+///
+/// `fitted_text_scale` already keeps the zoom itself within the display for the design-sized window,
+/// but the zoom grows whatever size the window currently has, and the user may have stretched it
+/// larger by hand. Clamping here means the window can never end up bigger than the screen whatever
+/// combination of the two got it there.
+fn clamp_to_work_area(window: &slint::Window, wanted: slint::PhysicalSize) -> slint::PhysicalSize {
+    let Some((work, frame)) = work_area_and_frame(window) else {
+        return wanted;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let widest = u32::try_from((work.2 - work.0) - frame.0).unwrap_or(u32::MAX);
+    #[allow(clippy::cast_sign_loss)]
+    let tallest = u32::try_from((work.3 - work.1) - frame.1).unwrap_or(u32::MAX);
+    slint::PhysicalSize::new(wanted.width.min(widest), wanted.height.min(tallest))
+}
+
+/// Renders the zoom for the settings row.
+fn format_text_scale(text_scale: f32) -> String {
+    format!("{:.0}%", text_scale * 100.0)
+}
+
+/// The zoom the window is currently showing, which is the base every step is taken from.
+fn applied_text_scale(state: &RuntimeState) -> f32 {
+    state.applied_text_scale.lock().map_or(1.0, |scale| *scale)
+}
+
+/// Writes a zoom that is still waiting out its save delay, on the way out.
+///
+/// The delay only pays off if the change survives a quick exit; quitting inside it would otherwise
+/// lose the zoom and bring the old one back on the next start.
+fn flush_pending_text_scale(state: &RuntimeState) {
+    let applied = applied_text_scale(state);
+    if (applied - current_config(state).text_scale).abs() < f32::EPSILON {
+        return;
+    }
+    if state.config_read_only.load(Ordering::Acquire) {
+        return;
+    }
+    mutate_config(state, |config| config.text_scale = applied);
+}
+
+/// Sets the zoom now and saves it once the user stops changing it.
+///
+/// The two are deliberately separated. Saving rewrites and flushes the whole configuration, measured
+/// at ~96 ms, and a flick of the wheel delivers a dozen notches in well under a second; writing on
+/// every one would both stutter the interface and wear the disk for a single gesture. The window and
+/// the settings row therefore follow the zoom immediately, and only the settled value reaches the
+/// file, `TEXT_SCALE_SAVE_DELAY` after the last change. Re-starting the timer on each change is what
+/// makes it settle rather than fire mid-gesture.
+fn set_zoom(
+    window: &slint::Window,
+    state: &RuntimeState,
+    weak: &Weak<ControlPanel>,
+    timer: &Timer,
+    base_scale: f32,
+    text_scale: f32,
+) {
+    // Held down to what the display can actually show before anything else looks at it, so the
+    // reported, remembered and applied zoom all agree on the value that is really in effect.
+    let text_scale = fitted_text_scale(
+        window,
+        base_scale,
+        text_scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE),
+    );
+    if (text_scale - applied_text_scale(state)).abs() < f32::EPSILON {
+        return;
+    }
+    if let Ok(mut applied) = state.applied_text_scale.lock() {
+        *applied = text_scale;
+    }
+    // Shown first, so the interface tracks the gesture even though nothing has been written yet.
+    apply_text_scale(window, base_scale, text_scale);
+    if let Some(panel) = weak.upgrade() {
+        panel.set_text_scale_text(format_text_scale(text_scale).into());
+    }
+
+    // A configuration that failed to load must not be written at all, and the reason is reported once
+    // here rather than on every notch of a flick.
+    if state.config_read_only.load(Ordering::Acquire) {
+        refuse_config_write(state);
+        return;
+    }
+
+    let runtime = state.clone();
+    timer.start(TimerMode::SingleShot, TEXT_SCALE_SAVE_DELAY, move || {
+        // Read back rather than captured, so the value written is the one that settled last.
+        let settled = applied_text_scale(&runtime);
+        mutate_config(&runtime, |config| config.text_scale = settled);
+    });
+}
+
+/// Installs `Ctrl` + wheel and `Ctrl` + `+`/`-`/`0` zooming, and applies the saved zoom.
+///
+/// The wheel is intercepted on the winit event filter rather than in Slint because it has to be taken
+/// before the widget under the cursor sees it: otherwise every scroll view would scroll the page at
+/// the same time as the interface zoomed. The filter also gets the resize events, which is where a
+/// zoom that had nowhere to go — because the backend had no size yet, or the window was maximized —
+/// is applied once there is room for it, and where a move to a display with a different DPI is picked
+/// up, since winit's factor is re-read there.
+fn install_text_zoom(panel: &ControlPanel, state: &RuntimeState, timer: Rc<Timer>) {
+    let runtime = state.clone();
+    let weak = panel.as_weak();
+    let window = panel.window();
+    let mut base_scale = display_scale_factor(window);
+    let mut modifiers = ModifiersState::default();
+    // Touchpad travel not yet spent on a step; see `wheel_notches`.
+    let mut wheel_travel = 0.0_f64;
+
+    // The saved zoom is deliberately *not* applied here. Straight after `show()` the backend has not
+    // been told its size yet, so the window still reports whatever it was created with, and asking for
+    // a multiple of that would be clamped up to the minimum size — which the resize below then pins
+    // for good. The first resize event carries the real size, and applies the zoom from there.
+
+    window.on_winit_window_event(move |window, event| match event {
+        WindowEvent::ModifiersChanged(changed) => {
+            // winit offers no way to query the modifiers, so the only source is this event.
+            modifiers = changed.state();
+            EventResult::Propagate
+        }
+        WindowEvent::MouseWheel { delta, .. } if modifiers.control_key() => {
+            let notches = wheel_notches(delta, &mut wheel_travel);
+            if notches != 0 {
+                let current = applied_text_scale(&runtime);
+                set_zoom(
+                    window,
+                    &runtime,
+                    &weak,
+                    &timer,
+                    base_scale,
+                    current * TEXT_SCALE_STEP.powi(notches),
+                );
+            }
+            // Consumed either way: passing it on would scroll the page as well as zoom it.
+            EventResult::PreventDefault
+        }
+        WindowEvent::KeyboardInput { event, .. }
+            if modifiers.control_key() && event.state.is_pressed() =>
+        {
+            match zoom_key(event.physical_key, &event.logical_key) {
+                Some(ZoomKey::Step(notches)) => {
+                    let current = applied_text_scale(&runtime);
+                    set_zoom(
+                        window,
+                        &runtime,
+                        &weak,
+                        &timer,
+                        base_scale,
+                        current * TEXT_SCALE_STEP.powi(notches),
+                    );
+                    EventResult::PreventDefault
+                }
+                Some(ZoomKey::Reset) => {
+                    set_zoom(window, &runtime, &weak, &timer, base_scale, 1.0);
+                    EventResult::PreventDefault
+                }
+                None => EventResult::Propagate,
+            }
+        }
+        WindowEvent::Resized(_) => {
+            if let Some(scale_factor) =
+                window.with_winit_window(winit::window::Window::scale_factor)
+            {
+                base_scale = scale_factor_to_f32(scale_factor);
+            }
+            // The applied zoom, not the saved one: a change still waiting out its save delay must not
+            // be undone by an unrelated resize. It is refitted here as well, so moving the window to a
+            // display that cannot show the current zoom takes it down instead of growing the window
+            // off the edge, and a move to a roomier display gives the range back.
+            let applied = applied_text_scale(&runtime);
+            let fitted = fitted_text_scale(window, base_scale, applied);
+            if (fitted - applied).abs() > f32::EPSILON {
+                if let Ok(mut current) = runtime.applied_text_scale.lock() {
+                    *current = fitted;
+                }
+                if let Some(panel) = weak.upgrade() {
+                    panel.set_text_scale_text(format_text_scale(fitted).into());
+                }
+            }
+            apply_text_scale(window, base_scale, fitted);
+            EventResult::Propagate
+        }
+        _ => EventResult::Propagate,
+    });
 }
 
 fn refresh_runtime_panel(panel: &ControlPanel, state: &RuntimeState) {
@@ -2969,8 +3481,17 @@ mod tests {
 
     /// A `RuntimeState` pointing at throwaway paths, for the tests that only exercise the shared
     /// state rather than the files behind it.
+    ///
+    /// Every call gets its own directory. The tests run in parallel, and the ones that actually save
+    /// would otherwise share one config file and overwrite each other's fixtures.
     fn test_state() -> RuntimeState {
-        let root = std::env::temp_dir().join(format!("lazy-process-state-{}", std::process::id()));
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lazy-process-state-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         RuntimeState {
             config: Arc::new(Mutex::new(AppConfig::default())),
             statuses: Arc::new(Mutex::new(Vec::new())),
@@ -2984,6 +3505,7 @@ mod tests {
             managed_pids: Arc::new(Mutex::new(HashSet::new())),
             kill_target: Arc::new(Mutex::new(None)),
             explorer_error: Arc::new(Mutex::new(None)),
+            applied_text_scale: Arc::new(Mutex::new(1.0)),
             config_read_only: Arc::new(AtomicBool::new(false)),
             config_path: root.join("config.json"),
             event_log_path: root.join("events.log"),
@@ -3109,10 +3631,16 @@ mod tests {
 
     #[test]
     fn adaptive_sampling_backs_off_without_matches() {
+        // The default is five seconds, so a single idle cycle already doubles to the ten-second
+        // ceiling. The backoff is still observable, it just saturates after one step.
         let config = AppConfig::default();
         assert_eq!(
+            adaptive_sample_interval(&config, &[], 100, 0),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
             adaptive_sample_interval(&config, &[], 100, 1),
-            Duration::from_secs(4)
+            Duration::from_secs(10)
         );
         assert_eq!(
             adaptive_sample_interval(&config, &[], 1_500, 3),
@@ -3120,7 +3648,7 @@ mod tests {
         );
         assert_eq!(
             adaptive_sample_interval(&config, &[status(ActivityState::Quiet)], 100, 0),
-            Duration::from_secs(2)
+            Duration::from_secs(5)
         );
     }
 
@@ -3747,5 +4275,231 @@ mod tests {
         assert_eq!(format_wait(45), "45 秒");
         // Rounded up, so a countdown never displays as "0 分" while still waiting.
         assert_eq!(format_wait(61), "2 分");
+    }
+
+    fn character(text: &str) -> Key {
+        Key::Character(text.into())
+    }
+
+    #[test]
+    fn zoom_shortcuts_accept_the_main_row_and_the_numpad() {
+        let none = Key::Named(slint::winit_030::winit::keyboard::NamedKey::Enter);
+        for key in [KeyCode::Equal, KeyCode::NumpadAdd] {
+            assert_eq!(
+                zoom_key(PhysicalKey::Code(key), &none),
+                Some(ZoomKey::Step(1)),
+                "{key:?} must zoom in"
+            );
+        }
+        for key in [KeyCode::Minus, KeyCode::NumpadSubtract] {
+            assert_eq!(
+                zoom_key(PhysicalKey::Code(key), &none),
+                Some(ZoomKey::Step(-1)),
+                "{key:?} must zoom out"
+            );
+        }
+        for key in [KeyCode::Digit0, KeyCode::Numpad0] {
+            assert_eq!(
+                zoom_key(PhysicalKey::Code(key), &none),
+                Some(ZoomKey::Reset),
+                "{key:?} must reset"
+            );
+        }
+    }
+
+    /// A keyboard layout winit cannot name physically still has to zoom, and the keys that are not
+    /// zoom shortcuts must be left for the widget that has focus.
+    #[test]
+    fn zoom_shortcuts_fall_back_to_the_character_and_leave_everything_else_alone() {
+        let unidentified = PhysicalKey::Unidentified(
+            slint::winit_030::winit::keyboard::NativeKeyCode::Unidentified,
+        );
+        for (text, expected) in [
+            ("+", Some(ZoomKey::Step(1))),
+            ("=", Some(ZoomKey::Step(1))),
+            ("-", Some(ZoomKey::Step(-1))),
+            ("_", Some(ZoomKey::Step(-1))),
+            ("0", Some(ZoomKey::Reset)),
+            ("a", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                zoom_key(unidentified, &character(text)),
+                expected,
+                "{text:?} was mapped wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wheel_event_only_ever_steps_once_in_its_own_direction() {
+        let mut travel = 0.0;
+        // Windows sends whole detents, so only the sign is meaningful — never the distance.
+        assert_eq!(
+            wheel_notches(&MouseScrollDelta::LineDelta(0.0, 1.0), &mut travel),
+            1
+        );
+        assert_eq!(
+            wheel_notches(&MouseScrollDelta::LineDelta(0.0, 0.5), &mut travel),
+            1
+        );
+        assert_eq!(
+            wheel_notches(&MouseScrollDelta::LineDelta(0.0, -1.0), &mut travel),
+            -1
+        );
+        assert_eq!(
+            wheel_notches(&MouseScrollDelta::LineDelta(0.0, -12.0), &mut travel),
+            -1
+        );
+        // A horizontal-only wheel is not a zoom.
+        assert_eq!(
+            wheel_notches(&MouseScrollDelta::LineDelta(3.0, 0.0), &mut travel),
+            0
+        );
+    }
+
+    /// A precision touchpad sends a fine stream of pixel deltas rather than detents. Stepping on each
+    /// one would run the zoom from end to end in a single gesture, so the travel is banked and spent
+    /// a detent at a time, with the remainder carried over.
+    #[test]
+    fn touchpad_travel_is_banked_and_spent_a_detent_at_a_time() {
+        use slint::winit_030::winit::dpi::PhysicalPosition;
+        let pixel = |y: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        let mut travel = 0.0;
+
+        // Below a detent's worth of travel, nothing happens — not one step per event.
+        for _ in 0..7 {
+            assert_eq!(wheel_notches(&pixel(5.0), &mut travel), 0);
+        }
+        // 35 px banked; the next 5 reach the detent and spend it, leaving nothing behind.
+        assert_eq!(wheel_notches(&pixel(5.0), &mut travel), 1);
+        assert_eq!(wheel_notches(&pixel(0.0), &mut travel), 0);
+
+        // A single event worth several detents is still one step, never a jump of several: the whole
+        // travel is spent on that one step rather than queued into steps the user did not ask for.
+        let mut travel = 0.0;
+        assert_eq!(wheel_notches(&pixel(200.0), &mut travel), 1);
+        assert_eq!(wheel_notches(&pixel(0.0), &mut travel), 0);
+
+        // Direction follows the banked total, so scrolling back undoes the travel rather than
+        // zooming the other way on the first pixel.
+        let mut travel = 0.0;
+        assert_eq!(wheel_notches(&pixel(-120.0), &mut travel), -1);
+        assert_eq!(wheel_notches(&pixel(30.0), &mut travel), 0);
+    }
+
+    #[test]
+    fn the_zoom_is_reported_as_a_percentage() {
+        assert_eq!(format_text_scale(1.0), "100%");
+        assert_eq!(format_text_scale(1.1), "110%");
+        assert_eq!(format_text_scale(0.75), "75%");
+        assert_eq!(format_text_scale(MAX_TEXT_SCALE), "200%");
+    }
+
+    /// A flick of the wheel arrives as many events, so the steps have to compose. Stepping from the
+    /// saved value instead of the applied one would lose every notch but the last.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn repeated_zoom_steps_compose_and_stop_at_the_bounds() {
+        let mut scale = 1.0_f32;
+        for _ in 0..3 {
+            scale = (scale * TEXT_SCALE_STEP).clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+        }
+        assert!(
+            (scale - TEXT_SCALE_STEP.powi(3)).abs() < 1e-5,
+            "got {scale}"
+        );
+
+        // At the top the step is a no-op, so holding the shortcut cannot push the zoom past the cap
+        // and leave the settings row showing a value the window is not using.
+        let capped = (MAX_TEXT_SCALE * TEXT_SCALE_STEP).clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+        assert_eq!(capped, MAX_TEXT_SCALE);
+        let floored = (MIN_TEXT_SCALE / TEXT_SCALE_STEP).clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+        assert_eq!(floored, MIN_TEXT_SCALE);
+    }
+
+    /// The zoom the window shows and the zoom on disk are separate: a change is applied at once but
+    /// written later, so stepping must read the applied value or a flick would lag behind itself.
+    #[test]
+    fn the_applied_zoom_is_tracked_separately_from_the_saved_one() {
+        let state = test_state();
+        assert!((applied_text_scale(&state) - 1.0).abs() < f32::EPSILON);
+        *state.applied_text_scale.lock().unwrap() = 1.5;
+        assert!((applied_text_scale(&state) - 1.5).abs() < f32::EPSILON);
+        // The configuration is untouched until the save delay elapses.
+        assert!((current_config(&state).text_scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Quitting inside the save delay must not lose the zoom.
+    #[test]
+    fn a_pending_zoom_is_written_out_on_the_way_to_exit() {
+        let state = test_state();
+        *state.applied_text_scale.lock().unwrap() = 1.5;
+        flush_pending_text_scale(&state);
+        assert!((current_config(&state).text_scale - 1.5).abs() < f32::EPSILON);
+
+        // Nothing to do once they agree, so quitting is not a write on every exit.
+        flush_pending_text_scale(&state);
+        assert!((current_config(&state).text_scale - 1.5).abs() < f32::EPSILON);
+    }
+
+    /// A configuration that failed to load must never be overwritten, not even on the way out.
+    #[test]
+    fn a_pending_zoom_is_not_written_when_the_config_is_read_only() {
+        let state = test_state();
+        state.config_read_only.store(true, Ordering::Release);
+        *state.applied_text_scale.lock().unwrap() = 1.5;
+        flush_pending_text_scale(&state);
+        assert!((current_config(&state).text_scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The ceiling is what stops the zoom from pushing the settings row off the screen, so it has to
+    /// shrink a 1080p display to something the window actually fits in, and leave a large display
+    /// alone.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn the_zoom_is_capped_by_the_work_area_it_has_to_fit_in() {
+        // This machine's real numbers: a 1920x1080 display with a taskbar, so a 1920x1032 work area,
+        // and a 16x39 window frame that the zoom does not grow.
+        let ceiling = ceiling_from_work_area((0, 0, 1920, 1032), (16, 39), 1.0).unwrap();
+        assert!(ceiling > 1.25, "1.25x should still fit, got {ceiling}");
+        assert!(ceiling < 1.5, "1.5x does not fit, got {ceiling}");
+        // Exactly the tighter of the two axes: (1032 - 39) / 680.
+        assert!((ceiling - 993.0 / 680.0).abs() < 0.0001);
+
+        // A display with room to spare leaves the full range available.
+        let roomy = ceiling_from_work_area((0, 0, 3840, 2088), (16, 39), 1.0).unwrap();
+        assert!(roomy > MAX_TEXT_SCALE, "4K should allow the whole range");
+
+        // A scaled display must not have its zoom measured against physical pixels, so the ceiling is
+        // expressed in the same units as the requested zoom.
+        let scaled = ceiling_from_work_area((0, 0, 3840, 2088), (16, 39), 2.0).unwrap();
+        assert!((scaled - roomy / 2.0).abs() < 0.0001);
+
+        // A monitor that does not start at the origin is measured by its extent, not its edges.
+        let offset = ceiling_from_work_area((-1920, -200, 0, 832), (16, 39), 1.0).unwrap();
+        assert!((offset - ceiling).abs() < 0.0001);
+    }
+
+    /// A display that cannot be read, or a nonsense DPI, must fall back to the configured range rather
+    /// than to some arbitrary smaller one.
+    #[test]
+    fn an_unreadable_display_does_not_restrict_the_zoom() {
+        assert!(ceiling_from_work_area((0, 0, 1920, 1032), (16, 39), 0.0).is_none());
+        assert!(ceiling_from_work_area((0, 0, 1920, 1032), (16, 39), -1.0).is_none());
+    }
+
+    /// A window that has somehow ended up larger than the display — a saved zoom from a bigger
+    /// monitor, say — must not drag the zoom below the user's own minimum.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn the_ceiling_never_pushes_the_zoom_below_the_minimum() {
+        let ceiling = ceiling_from_work_area((0, 0, 320, 200), (16, 39), 1.0).unwrap();
+        assert!(
+            ceiling < MIN_TEXT_SCALE,
+            "this display is smaller than the window"
+        );
+        let fitted = ceiling.max(MIN_TEXT_SCALE);
+        assert_eq!(fitted, MIN_TEXT_SCALE);
     }
 }

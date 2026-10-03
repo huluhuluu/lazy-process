@@ -18,7 +18,25 @@ use windows::{
     core::PCWSTR,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The sampling interval new installations start with. Sampling walks every process and thread on
+/// the machine, so this trades reaction time for a smaller steady-state cost.
+pub const DEFAULT_SAMPLE_INTERVAL_SECONDS: u64 = 5;
+
+/// The value [`DEFAULT_SAMPLE_INTERVAL_SECONDS`] replaced. Schema 1 wrote it into every config, so a
+/// file still carrying it has to be migrated rather than left alone.
+const LEGACY_SAMPLE_INTERVAL_SECONDS: u64 = 2;
+
+/// How far the user may zoom the panel text, as a multiplier on the display's own scale factor.
+/// The lower bound keeps the smallest 9px labels legible; the upper bound stops a single config edit
+/// from producing a window larger than any screen.
+pub const MIN_TEXT_SCALE: f32 = 0.75;
+pub const MAX_TEXT_SCALE: f32 = 2.0;
+
+/// One Ctrl + wheel notch, and one Ctrl + `+`/`-` press. Geometric rather than additive so every
+/// notch changes the text size by the same proportion, whether the user is at 80% or 180%.
+pub const TEXT_SCALE_STEP: f32 = 1.1;
 
 /// Which palette the panel uses. `System` follows the Windows "apps use light mode" setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +115,10 @@ pub struct AppConfig {
     pub cpu_quiet_percent: f32,
     pub io_quiet_bytes_per_sample: u64,
     pub theme: ThemePreference,
+    /// Extra zoom on top of the display's own scale factor. 1.0 means "whatever Windows says".
+    /// Values outside [`MIN_TEXT_SCALE`]`..=`[`MAX_TEXT_SCALE`] are clamped when loading rather than
+    /// rejected, because a config written by a future version should still start the app.
+    pub text_scale: f32,
     /// Suspends nothing while a game or presentation is on screen. An unfocused group is exactly
     /// what a full-screen application looks like, so this is on by default.
     pub pause_while_fullscreen: bool,
@@ -111,10 +133,11 @@ impl Default for AppConfig {
             schema_version: SCHEMA_VERSION,
             globally_enabled: true,
             start_with_windows: false,
-            sample_interval_seconds: 2,
+            sample_interval_seconds: DEFAULT_SAMPLE_INTERVAL_SECONDS,
             cpu_quiet_percent: 1.0,
             io_quiet_bytes_per_sample: 4 * 1024,
             theme: ThemePreference::System,
+            text_scale: 1.0,
             pause_while_fullscreen: true,
             rules: built_in_presets(),
             extra_fields: BTreeMap::new(),
@@ -291,7 +314,9 @@ impl AppConfig {
                 "配置来自更新版本",
             ));
         }
+        let loaded_version = config.schema_version;
         config.schema_version = SCHEMA_VERSION;
+        config.migrate(loaded_version);
         // Repair values that are out of range before validating, so a hand-edited file with one bad
         // bit is fixed rather than rejected. Rejecting it would drop into the degraded "config failed
         // to load" mode, where the next settings change writes a default over the user's file.
@@ -300,9 +325,31 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Brings a file written by an older schema up to the current defaults. Only values that the old
+    /// version wrote out unconditionally are touched, so a deliberate choice is left alone.
+    fn migrate(&mut self, loaded_version: u32) {
+        if loaded_version < 2 {
+            // Schema 1 serialized its default of 2 seconds into every config, so a file still holding
+            // exactly that value is the old default rather than a considered choice. Anyone who wants
+            // 2 back can set it again; the cost of leaving it is that the new default never applies
+            // to existing installations at all.
+            if self.sample_interval_seconds == LEGACY_SAMPLE_INTERVAL_SECONDS {
+                self.sample_interval_seconds = DEFAULT_SAMPLE_INTERVAL_SECONDS;
+            }
+        }
+    }
+
     /// Clamps values that a hand-edited file can push out of range. Only fields where a sensible
     /// repair exists are touched; everything else is left for [`Self::validate`] to reject.
     fn normalize(&mut self) {
+        // Only NaN needs the default: `clamp` returns NaN unchanged and NaN then compares false
+        // against every bound, which would make `validate` reject a file the app itself produced. An
+        // infinity is out of range like any other value, so `clamp` folds it onto the nearer bound.
+        if self.text_scale.is_nan() {
+            self.text_scale = 1.0;
+        }
+        self.text_scale = self.text_scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+
         for rule in &mut self.rules {
             if let Some(schedule) = &mut rule.schedule {
                 // Only bits 0-6 name a day. Clearing the rest keeps the days the user did pick; a
@@ -322,6 +369,13 @@ impl AppConfig {
         }
         if self.io_quiet_bytes_per_sample > 1024 * 1024 * 1024 {
             return Err(invalid_config("I/O 静默阈值不能超过每次采样 1 GiB"));
+        }
+        if !self.text_scale.is_finite()
+            || !(MIN_TEXT_SCALE..=MAX_TEXT_SCALE).contains(&self.text_scale)
+        {
+            return Err(invalid_config(format!(
+                "界面缩放必须在 {MIN_TEXT_SCALE} 到 {MAX_TEXT_SCALE} 之间"
+            )));
         }
 
         let mut ids = HashSet::new();
@@ -654,6 +708,130 @@ mod tests {
             days: 0b1000_0000,
         });
         assert!(strict.save_atomic(&path).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    // Exact comparison is the point: the clamped value is one of the two bounds, verbatim.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn an_out_of_range_text_scale_is_repaired_on_load_not_rejected() {
+        let path = test_config_path("text-scale-repair");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let config = AppConfig {
+            text_scale: 9.0,
+            ..AppConfig::default()
+        };
+        // `save_atomic` validates, so write the JSON directly, as a hand edit would.
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).expect("the file must load after repair");
+        assert_eq!(loaded.text_scale, MAX_TEXT_SCALE);
+
+        // Saving stays strict, so a value the UI could never produce cannot be written back out.
+        let strict = AppConfig {
+            text_scale: 0.1,
+            ..AppConfig::default()
+        };
+        assert!(strict.save_atomic(&path).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// NaN cannot be expressed in JSON, so it can only reach the config through code. It still has
+    /// to be folded back to the default: `clamp` passes NaN through untouched and it then compares
+    /// false against every bound, which would let `validate` reject a config the app itself built.
+    /// An infinity, by contrast, is out of range like any other value and is clamped to the bound.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn a_nan_text_scale_is_folded_back_to_the_default() {
+        let mut config = AppConfig {
+            text_scale: f32::NAN,
+            ..AppConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.text_scale, 1.0);
+        assert!(config.validate().is_ok());
+
+        config.text_scale = f32::INFINITY;
+        config.normalize();
+        assert_eq!(config.text_scale, MAX_TEXT_SCALE);
+        assert!(config.validate().is_ok());
+
+        config.text_scale = f32::NEG_INFINITY;
+        config.normalize();
+        assert_eq!(config.text_scale, MIN_TEXT_SCALE);
+        assert!(config.validate().is_ok());
+    }
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn text_scale_defaults_to_unscaled() {
+        let path = test_config_path("text-scale-default");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A config written before the field existed must come back at 1.0, not zero.
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "rules": [] })).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded.text_scale, 1.0);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_old_schema_gets_the_new_default_sample_interval() {
+        let path = test_config_path("migrate-interval");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "sample_interval_seconds": LEGACY_SAMPLE_INTERVAL_SECONDS,
+            "rules": []
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            loaded.sample_interval_seconds,
+            DEFAULT_SAMPLE_INTERVAL_SECONDS
+        );
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_old_schema_keeps_an_interval_the_user_chose() {
+        let path = test_config_path("migrate-interval-custom");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "sample_interval_seconds": 8,
+            "rules": []
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded.sample_interval_seconds, 8);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_current_schema_never_rewrites_the_sample_interval() {
+        let path = test_config_path("no-migrate");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let current = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "sample_interval_seconds": LEGACY_SAMPLE_INTERVAL_SECONDS,
+            "rules": []
+        });
+        fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
+
+        // A user on the current schema who deliberately picked 2 seconds keeps it.
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            loaded.sample_interval_seconds,
+            LEGACY_SAMPLE_INTERVAL_SECONDS
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

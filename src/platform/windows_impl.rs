@@ -26,8 +26,8 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, ERROR_PIPE_CONNECTED,
-            FILETIME, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, HWND, LPARAM,
-            LocalFree, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            FILETIME, GENERIC_READ, GENERIC_WRITE, GetLastError, GlobalFree, HANDLE, HLOCAL, HWND,
+            LPARAM, LocalFree, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::{
             Authorization::{
@@ -41,10 +41,12 @@ use windows::{
             SECURITY_SQOS_PRESENT, WriteFile,
         },
         System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
                 TH32CS_SNAPPROCESS,
             },
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
                 GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -425,6 +427,71 @@ pub fn local_minute_and_weekday() -> (u16, u8) {
     let now = unsafe { GetLocalTime() };
     let minute = now.wHour.saturating_mul(60).saturating_add(now.wMinute);
     (minute, u8::try_from(now.wDayOfWeek).unwrap_or(0))
+}
+
+/// Puts `text` on the clipboard as `CF_UNICODETEXT`. Used by the process explorer to copy a
+/// command line, which is the one field that is too long to read from a tooltip but is exactly what
+/// a user needs when writing a rule matcher.
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    // `CF_UNICODETEXT` lives in the Ole module of the `windows` crate, which would pull in COM for
+    // one integer. Its value is fixed by the Win32 ABI.
+    const CF_UNICODETEXT: u32 = 13;
+    // The NUL terminator is part of the payload; Windows expects a terminated string.
+    let mut wide = text.encode_utf16().collect::<Vec<u16>>();
+    wide.push(0);
+    let bytes = wide.len() * size_of::<u16>();
+    // SAFETY: the clipboard is opened and closed in this function, and the handle handed to
+    // `SetClipboardData` is owned by the clipboard afterwards, so it is not freed here.
+    unsafe {
+        OpenClipboard(None).map_err(|error| format!("无法打开剪贴板：{error}"))?;
+        // Every early return below must still close the clipboard, hence the closure.
+        let result = (|| -> Result<(), String> {
+            EmptyClipboard().map_err(|error| format!("无法清空剪贴板：{error}"))?;
+            let handle = GlobalAlloc(GMEM_MOVEABLE, bytes)
+                .map_err(|error| format!("无法分配剪贴板内存：{error}"))?;
+            let pointer = GlobalLock(handle);
+            if pointer.is_null() {
+                let _ = GlobalFree(Some(handle));
+                return Err("无法锁定剪贴板内存".to_owned());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), pointer.cast::<u8>(), bytes);
+            let _ = GlobalUnlock(handle);
+            if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))).is_err() {
+                // Ownership only transfers on success, so a failure leaks the block unless freed.
+                let _ = GlobalFree(Some(handle));
+                return Err("无法写入剪贴板".to_owned());
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Opens Explorer with the file selected. Falls back to opening the containing folder when the
+/// path no longer exists, so a stale row still leads somewhere useful.
+pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
+    let existing = path.exists();
+    let target = if existing {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+    if !target.exists() {
+        return Err(format!("路径不存在：{}", target.display()));
+    }
+    // `explorer.exe /select,"<file>"` is the documented way to highlight an item. `/select,` has to
+    // stay attached to the path, so the whole argument is one token.
+    let mut command = Command::new("explorer.exe");
+    if existing {
+        command.arg(format!("/select,\"{}\"", target.display()));
+    } else {
+        command.arg(target.as_os_str());
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法启动资源管理器：{error}"))
 }
 
 fn exact_process_start_ticks(pid: u32) -> Option<u64> {

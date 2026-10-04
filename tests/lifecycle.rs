@@ -22,7 +22,7 @@ use windows::Win32::{
     Foundation::CloseHandle,
     System::Threading::{
         BELOW_NORMAL_PRIORITY_CLASS, GetPriorityClass, NORMAL_PRIORITY_CLASS, OpenProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, SetPriorityClass,
     },
 };
 
@@ -39,6 +39,12 @@ impl Drop for Reaped {
 }
 
 /// A child that sits idle without spinning the CPU, so it reads as quiet on the first sample.
+///
+/// A child inherits the priority class of the process that spawns it, and a CI runner is not
+/// guaranteed to run the test process at Normal. Without pinning it, a runner that is itself at
+/// Below Normal would hand the child that class, and "throttling lowered the priority" would pass
+/// without the throttle having changed anything. Setting it explicitly keeps the baseline the test
+/// claims to establish.
 fn spawn_idle_child() -> Reaped {
     let child = Command::new("cmd.exe")
         .args(["/c", "pause"])
@@ -47,6 +53,12 @@ fn spawn_idle_child() -> Reaped {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("cmd.exe should start");
+    // SAFETY: the pid comes from a child this test owns, and the handle is closed immediately.
+    let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, false, child.id()) }
+        .expect("the child should be openable for a priority change");
+    let result = unsafe { SetPriorityClass(handle, NORMAL_PRIORITY_CLASS) };
+    let _ = unsafe { CloseHandle(handle) };
+    result.expect("the child priority should be settable");
     Reaped(child)
 }
 

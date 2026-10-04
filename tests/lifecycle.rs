@@ -113,12 +113,47 @@ fn test_config(executable: PathBuf) -> AppConfig {
     }
 }
 
-fn journal_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "lazy-process-it-{name}-{}-{:?}.json",
-        std::process::id(),
-        thread::current().id()
-    ))
+/// A journal path that removes itself, and the `.lock` file the controller's file lease creates
+/// alongside it, when the test ends.
+///
+/// Without this every run leaves one stray `.lock` behind in TEMP, because removing the journal
+/// alone does not touch the lease. The `.json` is removed only if it exists: some tests never
+/// write one, and a failed remove is not worth failing a passing test over.
+struct TestJournal(PathBuf);
+
+impl TestJournal {
+    fn new(name: &str) -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "lazy-process-it-{name}-{}-{:?}.json",
+            std::process::id(),
+            thread::current().id()
+        )))
+    }
+}
+
+impl Drop for TestJournal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("lock"));
+    }
+}
+
+impl std::ops::Deref for TestJournal {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TestJournal {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+fn journal_path(name: &str) -> TestJournal {
+    TestJournal::new(name)
 }
 
 #[test]
@@ -133,7 +168,7 @@ fn a_real_process_is_throttled_then_suspended_then_restored() {
 
     let journal = journal_path("lifecycle");
     let mut sampler = ProcessSampler::new();
-    let mut engine = Engine::new(WindowsResourceController::new(journal.clone()));
+    let mut engine = Engine::new(WindowsResourceController::new(journal.to_path_buf()));
     let processes = sample_until_present(&mut sampler, pid);
     let child_sample = processes
         .iter()
@@ -186,7 +221,6 @@ fn a_real_process_is_throttled_then_suspended_then_restored() {
     );
 
     drop(engine);
-    let _ = std::fs::remove_file(&journal);
 }
 
 #[test]
@@ -197,7 +231,7 @@ fn restore_all_puts_back_every_managed_process() {
 
     let journal = journal_path("restore-all");
     let mut sampler = ProcessSampler::new();
-    let mut controller = WindowsResourceController::new(journal.clone());
+    let mut controller = WindowsResourceController::new(journal.to_path_buf());
     let processes = sample_until_present(&mut sampler, pids[1]);
     let identities = pids
         .iter()
@@ -239,7 +273,6 @@ fn restore_all_puts_back_every_managed_process() {
     }
 
     drop(controller);
-    let _ = std::fs::remove_file(&journal);
 }
 
 /// Guards the identity check that stands between "end this process" and "end whatever now holds
@@ -264,7 +297,7 @@ fn terminating_a_stale_identity_is_refused() {
         started_at_ticks: identity.started_at_ticks.saturating_sub(3_600 * 10_000_000),
         ..identity.clone()
     };
-    let mut controller = WindowsResourceController::new(journal.clone());
+    let mut controller = WindowsResourceController::new(journal.to_path_buf());
     let error = controller
         .terminate_process(&stale)
         .expect_err("a mismatched identity must be refused");
@@ -284,7 +317,6 @@ fn terminating_a_stale_identity_is_refused() {
     }
 
     drop(controller);
-    let _ = std::fs::remove_file(&journal);
 }
 
 /// The handle must be closed even on the refused path; otherwise a leaked handle would keep the pid
@@ -307,7 +339,7 @@ fn a_refused_termination_does_not_leak_the_process_handle() {
         ..identity
     };
 
-    let mut controller = WindowsResourceController::new(journal.clone());
+    let mut controller = WindowsResourceController::new(journal.to_path_buf());
     for _ in 0..200 {
         assert!(controller.terminate_process(&stale).is_err());
     }
@@ -317,5 +349,4 @@ fn a_refused_termination_does_not_leak_the_process_handle() {
     );
 
     drop(controller);
-    let _ = std::fs::remove_file(&journal);
 }

@@ -2604,7 +2604,13 @@ mod tests {
     #[test]
     fn application_lease_is_shared_across_journal_paths() {
         // A private path, because the real application lease is held whenever the app is running.
-        let path = test_journal("application-lease").with_extension("state.json");
+        // Held as a TestJournal rather than derived from one: the lease is created at
+        // `.state.lock`, and the guard only knows to remove the `.lock` beside the path it was
+        // given. Deriving `.state.json` from a separate guard left that file behind every run.
+        let path = TestJournal(std::env::temp_dir().join(format!(
+            "lazy-process-application-lease-{}.state.json",
+            std::process::id()
+        )));
         let first = acquire_application_lease_at(&path, Duration::from_millis(20)).unwrap();
         assert!(acquire_application_lease_at(&path, Duration::from_millis(20)).is_err());
         drop(first);

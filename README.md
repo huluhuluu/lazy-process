@@ -263,6 +263,19 @@ The project is Windows-only: the `windows` crate bindings and the tray integrati
 do not build elsewhere. CI additionally runs `cargo audit` against the RustSec
 advisory database.
 
+### Releasing
+
+Pushing a tag matching `v*` runs the release workflow, which re-runs the four
+gates against that exact commit and publishes the binary:
+
+```powershell
+# Bump `version` in Cargo.toml first: the workflow rejects a tag that disagrees.
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release carries `lazy-process.exe` and a matching `.sha256`.
+
 ## License
 
 [MIT](LICENSE)

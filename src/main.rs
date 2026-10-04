@@ -3196,11 +3196,13 @@ fn read_registry_dword(subkey: &str, name: &str) -> Option<u32> {
     status.is_ok().then_some(value)
 }
 
+/// The colour of a state badge. The badge draws fixed light text on a solid fill, so each of these is
+/// chosen to keep that text at 4.5:1 or better; the amber was at 3.55 and read as a smear.
 fn state_color(state: ActivityState) -> Color {
     match state {
         ActivityState::Active => Color::from_rgb_u8(43, 124, 75),
         ActivityState::Quiet => Color::from_rgb_u8(95, 111, 101),
-        ActivityState::Throttled => Color::from_rgb_u8(183, 115, 31),
+        ActivityState::Throttled => Color::from_rgb_u8(158, 96, 18),
         ActivityState::Suspended => Color::from_rgb_u8(116, 76, 148),
         ActivityState::Unresponsive | ActivityState::Inaccessible => {
             Color::from_rgb_u8(173, 67, 55)
@@ -3479,12 +3481,38 @@ fn show_error(message: &str) {
 mod tests {
     use super::*;
 
+    /// A `RuntimeState` pointing at throwaway paths, plus the directory it owns.
+    ///
+    /// Derefs to the state, so a test can use it exactly as if it had a plain `RuntimeState`, and
+    /// deletes the directory when the test ends. Without the deletion every run left one empty
+    /// `lazy-process-state-*` directory behind in the temp directory, because nothing ever removed
+    /// them and the tests only ever wrote into them.
+    struct TestState {
+        state: RuntimeState,
+        root: PathBuf,
+    }
+
+    impl std::ops::Deref for TestState {
+        type Target = RuntimeState;
+
+        fn deref(&self) -> &RuntimeState {
+            &self.state
+        }
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            // Best effort: a failure here must not turn a passing test into a panic during unwind.
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     /// A `RuntimeState` pointing at throwaway paths, for the tests that only exercise the shared
     /// state rather than the files behind it.
     ///
     /// Every call gets its own directory. The tests run in parallel, and the ones that actually save
     /// would otherwise share one config file and overwrite each other's fixtures.
-    fn test_state() -> RuntimeState {
+    fn test_state() -> TestState {
         use std::sync::atomic::AtomicUsize;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -3492,7 +3520,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        RuntimeState {
+        let state = RuntimeState {
             config: Arc::new(Mutex::new(AppConfig::default())),
             statuses: Arc::new(Mutex::new(Vec::new())),
             candidates: Arc::new(Mutex::new(Vec::new())),
@@ -3509,7 +3537,8 @@ mod tests {
             config_read_only: Arc::new(AtomicBool::new(false)),
             config_path: root.join("config.json"),
             event_log_path: root.join("events.log"),
-        }
+        };
+        TestState { state, root }
     }
 
     #[test]

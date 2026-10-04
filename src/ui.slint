@@ -15,8 +15,12 @@ export global Theme {
     out property <color> border-soft: dark ? #242b2e : #e6ebe7;
     out property <color> ink: dark ? #e8edea : #202a24;
     out property <color> ink-muted: dark ? #c3ccc7 : #354139;
-    out property <color> ink-soft: dark ? #98a5a0 : #68736c;
-    out property <color> ink-faint: dark ? #7d8a85 : #7a857e;
+    // Both light greys are dark enough to clear 4.5:1 against the lightest surface they are drawn on
+    // (`#f5f7f5`, the canvas) as well as against white; the previous pair reached 4.58 and 3.56, so
+    // the faint one failed as body text. `ink-soft` is darkened alongside it to keep the two a
+    // visible step apart rather than collapsing them into the same grey.
+    out property <color> ink-soft: dark ? #98a5a0 : #5c6760;
+    out property <color> ink-faint: dark ? #7d8a85 : #69746d;
     out property <color> accent: dark ? #57c98c : #17633d;
     out property <color> accent-strong: dark ? #6bd79c : #35875c;
     out property <color> on-accent: dark ? #10201a : #ffffff;

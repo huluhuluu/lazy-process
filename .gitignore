@@ -3,3 +3,6 @@
 
 # Local maintenance scripts (contain machine-specific paths)
 /update-herdr-and-restore.ps1
+
+# Ad-hoc screenshots taken while checking the interface by hand
+/_shot_*.png

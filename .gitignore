@@ -7,5 +7,6 @@
 # Ad-hoc screenshots taken while checking the interface by hand
 /_shot_*.png
 
-# The release binary copied here for hand testing
+# The release binary and its checksum, copied here for hand testing
 /lazy-process.exe
+/lazy-process.exe.sha256

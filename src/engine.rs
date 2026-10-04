@@ -283,10 +283,19 @@ impl<C: ResourceController> Engine<C> {
                         }
                     }
                 } else if quiet_for >= rule.throttle_after_seconds {
-                    if !matches!(
-                        tracked.state,
-                        ActivityState::Throttled | ActivityState::Suspended
-                    ) && tracked.failed_action.is_none()
+                    // Suspension may have just been revoked — the user unticked "allow suspend",
+                    // or edited `suspend_after_seconds` past the elapsed quiet time — while the
+                    // group is still frozen. Wake it first: the `matches!` guard below skips
+                    // suspended groups, so without this the application would stay frozen for
+                    // good, since nothing else revisits an idle group the user may not touch.
+                    let woke = tracked.state != ActivityState::Suspended
+                        || restore_group(&mut self.controller, tracked, ActivityState::Active);
+                    if woke
+                        && !matches!(
+                            tracked.state,
+                            ActivityState::Throttled | ActivityState::Suspended
+                        )
+                        && tracked.failed_action.is_none()
                     {
                         tracked.identities.clone_from(&current_identities);
                         tracked.resources_modified = true;
@@ -440,7 +449,10 @@ impl<C: ResourceController> Engine<C> {
             .iter_mut()
             .find(|(key, _)| key.rule_id == rule_id && key.pid == pid)
         else {
-            return Ok(());
+            // The root exited between the click and this call. Returning `Ok` here would report an
+            // action that did not happen, to a user who then believes the app is out of management
+            // or awake when the next sample may throttle it again.
+            return Err(format!("PID {pid} 已退出"));
         };
         if !group.resources_modified {
             group.quiet_since = None;
@@ -473,6 +485,10 @@ impl<C: ResourceController> Engine<C> {
 
     /// Restores a group and holds it out of management until its root process exits. Survives only
     /// this run: an exclusion that should outlive a restart belongs in the rule.
+    ///
+    /// Returns whether the group was actually held. A group whose root exited between the click and
+    /// this call cannot be excluded, and reporting success for that would tell the user an app is
+    /// out of management when the next sample may throttle it again.
     pub fn exclude_group_for_session(&mut self, rule_id: &str, pid: u32) -> Result<(), String> {
         let result = self.restore_group(rule_id, pid);
         if let Some(key) = self
@@ -1281,6 +1297,26 @@ mod tests {
     }
 
     #[test]
+    fn turning_off_allow_suspend_wakes_an_already_suspended_group() {
+        let samples = vec![process(10, None, "codex.exe", 0.0, 0)];
+        let mut engine = Engine::new(FakeController::default());
+        engine.tick(&test_config(true), &samples, None, 0);
+        assert_eq!(
+            engine.tick(&test_config(true), &samples, None, 30)[0].state,
+            ActivityState::Suspended
+        );
+
+        // The user unchecks "allow suspend" while the group is idle and frozen.
+        let statuses = engine.tick(&test_config(false), &samples, None, 31);
+        assert_eq!(
+            statuses[0].state,
+            ActivityState::Throttled,
+            "a group must not stay suspended after suspension is no longer permitted"
+        );
+        assert_eq!(engine.controller.restores, 1);
+    }
+
+    #[test]
     fn activity_and_new_descendants_reset_quiet_timer() {
         let mut engine = Engine::new(FakeController::default());
         let config = test_config(false);
@@ -1962,6 +1998,17 @@ mod tests {
 
         // The exclusion dies with the process, so a restart is managed normally.
         engine.tick(&config, &[], None, 610);
+        assert!(!engine.is_held("codex", 10));
+    }
+
+    #[test]
+    fn acting_on_a_group_whose_process_already_exited_reports_failure() {
+        // The click and the worker command are separated in time, so the root can be gone by the
+        // time the action runs. Reporting success there would tell the user an app is awake or out
+        // of management when nothing happened.
+        let mut engine = Engine::new(FakeController::default());
+        assert!(engine.restore_group("codex", 10).is_err());
+        assert!(engine.exclude_group_for_session("codex", 10).is_err());
         assert!(!engine.is_held("codex", 10));
     }
 

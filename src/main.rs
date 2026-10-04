@@ -908,13 +908,18 @@ fn install_settings_callbacks(panel: &ControlPanel, state: &RuntimeState, zoom_t
         mutate_config(&runtime, |config| config.theme = theme);
         if let Some(panel) = weak.upgrade() {
             apply_theme(&panel, theme);
+            publish_save_error(&panel, &runtime);
         }
     });
     let runtime = state.clone();
+    let weak = panel.as_weak();
     panel.on_set_pause_while_fullscreen(move |enabled| {
         mutate_config(&runtime, |config| {
             config.pause_while_fullscreen = enabled;
         });
+        if let Some(panel) = weak.upgrade() {
+            publish_save_error(&panel, &runtime);
+        }
     });
     install_rule_library_callbacks(panel, state);
     let path = state.event_log_path.clone();
@@ -2070,6 +2075,22 @@ fn log_transitions(
     previous.retain(|key, _| current.contains(key));
 }
 
+/// Pushes the current save error to the panel's banner.
+///
+/// Separated out because a settings change that writes the configuration does not go through
+/// [`refresh_panel`]: the zoom is saved from a timer, and the theme and fullscreen checkboxes are
+/// saved straight from their callbacks. Without an explicit call those paths reported nothing, so a
+/// refused or failed write left the interface confidently showing a value that was never stored.
+fn publish_save_error(panel: &ControlPanel, state: &RuntimeState) {
+    let save_error = state
+        .save_error
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_default();
+    panel.set_save_error(save_error.into());
+}
+
 fn refresh_panel(panel: &ControlPanel, state: &RuntimeState) {
     let config = current_config(state);
     panel.set_globally_enabled(config.globally_enabled);
@@ -2085,13 +2106,7 @@ fn refresh_panel(panel: &ControlPanel, state: &RuntimeState) {
     panel.set_pause_while_fullscreen(config.pause_while_fullscreen);
     apply_theme(panel, config.theme);
     panel.set_candidate_cap(i32::try_from(MAX_CANDIDATE_ROWS).unwrap_or(i32::MAX));
-    let save_error = state
-        .save_error
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_default();
-    panel.set_save_error(save_error.into());
+    publish_save_error(panel, state);
     let rules = config
         .rules
         .iter()
@@ -2462,14 +2477,24 @@ fn set_zoom(
     // here rather than on every notch of a flick.
     if state.config_read_only.load(Ordering::Acquire) {
         refuse_config_write(state);
+        if let Some(panel) = weak.upgrade() {
+            publish_save_error(&panel, state);
+        }
         return;
     }
 
     let runtime = state.clone();
+    let weak = weak.clone();
     timer.start(TimerMode::SingleShot, TEXT_SCALE_SAVE_DELAY, move || {
         // Read back rather than captured, so the value written is the one that settled last.
         let settled = applied_text_scale(&runtime);
         mutate_config(&runtime, |config| config.text_scale = settled);
+        // This save has no other route to the banner: it runs from a timer, long after the gesture
+        // that started it, so a failure would otherwise be silent and the zoom would quietly revert
+        // on the next start.
+        if let Some(panel) = weak.upgrade() {
+            publish_save_error(&panel, &runtime);
+        }
     });
 }
 

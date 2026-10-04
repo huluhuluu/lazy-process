@@ -48,6 +48,25 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// Reads `theme` without ever failing on an unknown value.
+///
+/// A closed enum would make one unrecognised word — a typo in a hand-edited file, or a variant
+/// added by a newer version — reject the entire configuration. The load path then runs with
+/// monitoring disabled and writes locked, which is a far worse outcome than showing the default
+/// palette. `System` is the same fallback used when the field is absent.
+fn theme_or_system<'de, D>(deserializer: D) -> Result<ThemePreference, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<String>::deserialize(deserializer)?.as_deref() {
+            Some("light") => ThemePreference::Light,
+            Some("dark") => ThemePreference::Dark,
+            _ => ThemePreference::System,
+        },
+    )
+}
+
 /// Restricts a rule to part of the day. Windows that wrap past midnight are supported, so
 /// 22:00-06:00 means "the night", not "never".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +133,7 @@ pub struct AppConfig {
     pub sample_interval_seconds: u64,
     pub cpu_quiet_percent: f32,
     pub io_quiet_bytes_per_sample: u64,
+    #[serde(deserialize_with = "theme_or_system")]
     pub theme: ThemePreference,
     /// Extra zoom on top of the display's own scale factor. 1.0 means "whatever Windows says".
     /// Values outside [`MIN_TEXT_SCALE`]`..=`[`MAX_TEXT_SCALE`] are clamped when loading rather than
@@ -356,6 +376,11 @@ impl AppConfig {
                 // mask that was entirely out of range becomes zero, which means "every day" rather
                 // than a rule that can never run.
                 schedule.days &= 0b0111_1111;
+                // A minute past the end of the day is a typo, and clamping keeps the rule usable
+                // instead of sending the whole file into the read-only degraded mode. `contains`
+                // already tolerates any `u16`, so the clamp only affects what is written back.
+                schedule.start_minute = schedule.start_minute.min(1439);
+                schedule.end_minute = schedule.end_minute.min(1439);
             }
         }
     }
@@ -433,12 +458,21 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
         let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let mut file = fs::File::create(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, self).map_err(io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        replace_file_atomic(&temporary, path)
+        // The destination is only replaced by a successful move, so a failure anywhere before that
+        // would otherwise leave the half-written temp file behind on every retry. The config
+        // directory has no other stale-temp sweep.
+        let result = (|| {
+            let mut file = fs::File::create(&temporary)?;
+            serde_json::to_writer_pretty(&mut file, self).map_err(io::Error::other)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            replace_file_atomic(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 }
 
@@ -624,6 +658,44 @@ mod tests {
             ..Default::default()
         };
         assert!(matcher.summary().ends_with("pwsh.exe"));
+    }
+
+    #[test]
+    fn an_out_of_range_schedule_minute_is_repaired_rather_than_rejected() {
+        // A single typo'd minute must not drop the whole file into the read-only degraded mode,
+        // which is exactly what `normalize` exists to prevent for the day mask.
+        let mut config = AppConfig::default();
+        config.rules[0].schedule = Some(RuleSchedule {
+            start_minute: 1500,
+            end_minute: u16::MAX,
+            days: 0b0000_0001,
+        });
+        config.normalize();
+        let schedule = config.rules[0].schedule.unwrap();
+        assert_eq!(schedule.start_minute, 1439);
+        assert_eq!(schedule.end_minute, 1439);
+        // The days the user picked must survive the repair.
+        assert_eq!(schedule.days, 0b0000_0001);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file_behind() {
+        let path = test_config_path("temp-cleanup");
+        // A directory at the destination makes the final atomic move fail *after* the temp file has
+        // been written, which is the shape of the disk-full and destination-locked cases.
+        fs::create_dir_all(&path).unwrap();
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+
+        assert!(AppConfig::default().save_atomic(&path).is_err());
+        assert!(
+            !temporary.exists(),
+            "a failed save must not leave {} behind",
+            temporary.display()
+        );
+        // Remove the staging directory, not `path` alone: `path` is a directory here, and leaving
+        // its parent behind is what leaks a `lazy-process-config-*` entry per run.
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -1061,6 +1133,18 @@ mod tests {
             end_minute: 6 * 60,
             days,
         }
+    }
+
+    #[test]
+    fn an_unknown_theme_falls_back_instead_of_rejecting_the_config() {
+        // A typo in a hand-edited file, or a variant added by a newer version, must not send the
+        // whole config into the read-only degraded mode.
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value["theme"] = serde_json::json!("solarized");
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.theme, ThemePreference::System);
+        // The rest of the file must still load normally.
+        assert!(config.validate().is_ok());
     }
 
     #[test]

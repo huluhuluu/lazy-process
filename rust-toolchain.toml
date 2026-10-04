@@ -1,0 +1,12 @@
+# Pins the toolchain so CI and a local checkout compile and lint identically.
+#
+# Without this, CI's `dtolnay/rust-toolchain@stable` follows the newest release while a
+# developer's machine can sit several versions behind. That is not theoretical: this
+# repository's CI failed on the push of e0a71af because Rust 1.99.0's clippy gained the
+# pedantic `assert_is_empty` lint, which flagged seven `assert!(x.is_empty())` calls that
+# the locally installed 1.97.1 did not know about. Pinning makes a new lint arrive as a
+# deliberate toolchain bump, in a commit that can be reviewed and tested, instead of as a
+# red build on an unrelated change.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

@@ -2533,7 +2533,7 @@ mod tests {
         assert!(journal.exists());
         simulate_controller_crash(controller);
 
-        assert!(recover_suspended(&journal).is_empty());
+        assert_eq!(recover_suspended(&journal), Vec::<String>::new());
         let restored =
             WindowsResourceController::open_verified(&identity, PROCESS_SET_INFORMATION).unwrap();
         assert_eq!(unsafe { GetPriorityClass(restored.0) }, original);
@@ -2555,7 +2555,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
 
-        assert!(recover_suspended(&journal).is_empty());
+        assert_eq!(recover_suspended(&journal), Vec::<String>::new());
         assert!(!journal.exists());
     }
 
@@ -2638,7 +2638,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<String>::new());
         assert_eq!(resume_calls, 1);
         assert_eq!(resource_restore_calls, 2);
         assert!(!first.exists());
@@ -2715,7 +2715,7 @@ mod tests {
             BrokerAction::Suspend,
             vec![(identity.clone(), "需要管理员权限".into())],
         );
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<String>::new());
         assert!(!controller.originals.contains_key(&identity_key(&identity)));
         assert!(controller.elevated_owned.contains(&identity_key(&identity)));
 
@@ -2882,7 +2882,7 @@ mod tests {
     fn missing_journal_is_ignored_but_read_errors_are_reported() {
         let journal = test_journal("read-errors");
         let _ = fs::remove_dir(&journal);
-        assert!(recover_suspended(&journal).is_empty());
+        assert_eq!(recover_suspended(&journal), Vec::<String>::new());
 
         fs::create_dir(&journal).unwrap();
         let errors = recover_suspended(&journal);
@@ -2941,7 +2941,7 @@ mod tests {
             record.original_state_recorded = false;
             Ok(())
         });
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<String>::new());
         assert!(!journal.exists());
     }
 
@@ -2981,7 +2981,7 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
 
         simulate_controller_crash(controller);
-        assert!(recover_suspended(&journal).is_empty());
+        assert_eq!(recover_suspended(&journal), Vec::<String>::new());
         let status = child.wait().unwrap();
         assert!(status.success());
     }

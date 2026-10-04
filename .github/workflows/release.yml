@@ -1,0 +1,73 @@
+name: Release
+
+# Tag-driven: pushing v0.1.0 builds that tag and publishes it. Nothing is published
+# from `main` itself, so a release always names an exact commit.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same pin as CI, so the released binary is built by the compiler the gates ran against.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag is the source of truth for the version. Refusing a mismatch catches the
+      # mistake of tagging v0.2.0 while Cargo.toml still says 0.1.0.
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $manifest = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $manifest) {
+            throw "tag $tag does not match Cargo.toml version $manifest"
+          }
+          "releasing $manifest"
+
+      # The gates run again here on purpose: a tag can be pushed at a commit whose CI run
+      # was never looked at, and nothing should be published that does not pass them.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target/release/lazy-process.exe lazy-process.exe
+          $hash = (Get-FileHash lazy-process.exe -Algorithm SHA256).Hash
+          "$hash  lazy-process.exe" | Set-Content lazy-process.exe.sha256 -Encoding ascii
+          Get-Content lazy-process.exe.sha256
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' `
+            --title '${{ github.ref_name }}' `
+            --generate-notes `
+            --verify-tag `
+            lazy-process.exe lazy-process.exe.sha256
